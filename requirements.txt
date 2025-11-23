@@ -1,0 +1,7 @@
+typer
+pyside6
+qasync
+pymodbus
+rich
+pyserial
+ 

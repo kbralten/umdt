@@ -1,0 +1,52 @@
+name: Build Release Artifacts
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  build-windows-installer:
+    name: Build Windows EXEs + Installer
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          if (Test-Path requirements.txt) { python -m pip install -r requirements.txt }
+          if (Test-Path requirements-dev.txt) { python -m pip install -r requirements-dev.txt }
+
+      - name: Build executables (PyInstaller)
+        shell: pwsh
+        run: |
+          python build_dist.py
+
+      - name: Install Inno Setup (choco)
+        shell: pwsh
+        run: |
+          choco install innosetup -y
+
+      - name: Build installer (Inno Setup)
+        shell: pwsh
+        run: |
+          python build_installer.py
+
+      - name: List `dist/` artifacts
+        shell: pwsh
+        run: |
+          Write-Host 'Dist contents:'
+          Get-ChildItem -Path .\dist -Recurse | ForEach-Object { Write-Host $_.FullName }
+
+      - name: Upload installer to GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: dist/*.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
