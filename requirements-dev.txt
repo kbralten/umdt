@@ -1,2 +1,3 @@
 pyinstaller
+pytest
 # Add other development-only tools here, e.g. pytest, tox, pre-commit
