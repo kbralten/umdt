@@ -13,7 +13,7 @@ This README documents the current CLI surface and runtime behavior implemented i
 - Install runtime dependencies in your development environment:
 
 ```bash
-C:/Users/kevin/Dev/umdt/.conda/python.exe -m pip install -r requirements.txt
+pip install -r requirements.txt
 ```
 
 ## CLI Commands (current)
@@ -93,4 +93,4 @@ Known limitations / notes:
 
 ## Development
 - Entry points: `main_cli.py` (CLI) and `main_gui.py` (GUI).
-- Tests: `pytest` is configured; run locally as shown above.
+- Tests: `pytest` is configured.
