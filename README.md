@@ -91,6 +91,21 @@ Known limitations / notes:
 - `--endian all` is supported for single-value reads (shows Big/Little for 16-bit, and all four permutations for a single 32-bit long). For multi-value reads the CLI/GUI prefer a single selected endian to keep table layouts predictable.
 - The GUI currently reuses many CLI helpers; future refactors may extract decoding into a shared module.
 
+## Mock Server (diagnostic sandbox)
+UMDT now ships with a configurable Modbus slave that can simulate TCP or serial endpoints, inject faults, and expose register/coil behavior for demos and regression tests.
+
+- CLI entrypoint: `python mock_server_cli.py`
+    - `start --config configs/pump.json --tcp-host 0.0.0.0 --tcp-port 15020 --interactive` launches the server and opens a small REPL for runtime edits (set register values, toggle rules, update fault knobs, tail diagnostics events).
+    - `groups add/list/remove/reset` modify register groups within a JSON/YAML config.
+    - `values set/clear` manage per-address rules (frozen values, ignore-write, forced exceptions).
+    - `faults inject` patches default latency/drop/bit-flip settings in configs.
+    - `status` prints a summary (unit id, group count, latency, transport) for a config file.
+- GUI entrypoint: `python mock_server_gui.py`
+    - Provides a live control panel for loading a config, starting/stopping TCP or serial transports, writing on-the-fly values, applying rules, adjusting fault injection knobs, and viewing diagnostics events streamed from the mock device.
+    - Register groups load into a sortable table; manual write/rule widgets target any data type (holding/input/coil/discrete). Fault sliders feed directly into the diagnostics manager.
+
+Configs are YAML/JSON files (see `server.md`) that describe register groups, per-address rules, scripted values, and initial fault profiles. Both the CLI and GUI share the same asyncio-first engine, transport coordinator, and diagnostics manager so switching between front ends is seamless.
+
 ## Development
-- Entry points: `main_cli.py` (CLI) and `main_gui.py` (GUI).
+- Entry points: `main_cli.py` (diagnostics CLI), `main_gui.py` (diagnostics GUI), `mock_server_cli.py` (mock server CLI), and `mock_server_gui.py` (mock server GUI).
 - Tests: `pytest` is configured; run locally as shown above.

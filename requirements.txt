@@ -5,3 +5,4 @@ pymodbus
 rich
 pyserial
 pyserial-asyncio 
+PyYAML

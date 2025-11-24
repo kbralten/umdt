@@ -1,3 +1,4 @@
 pyinstaller
 pytest
+pytest-asyncio
 # Add other development-only tools here, e.g. pytest, tox, pre-commit

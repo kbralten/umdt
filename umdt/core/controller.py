@@ -1,10 +1,14 @@
 import asyncio
 import time
 import struct
-from typing import List, Callable, Dict, Optional, Tuple
+from typing import List, Callable, Dict, Optional, Tuple, Sequence, Union
 from umdt.transports.base import TransportInterface
 from umdt.transports.manager import ConnectionManager
 from umdt.database.logging import DBLogger
+from umdt.core.data_types import (
+    DATA_TYPE_PROPERTIES,
+    DataType,
+)
 import logging
 logger = logging.getLogger("umdt.controller")
 
@@ -267,103 +271,159 @@ class CoreController:
         return True, data
 
     async def modbus_read_holding_registers(self, unit: int, address: int, count: int) -> Optional[List[int]]:
-        """Read holding registers (FC03) using the shared transport.
+        """Backward compatible helper for FC03."""
 
-        Returns list of register values (16-bit ints) or None on error.
-        """
+        return await self._modbus_read_registers_fc(unit, address, count, 0x03)
+
+    async def modbus_write_registers(self, unit: int, address: int, values: List[int]) -> bool:
+        """Backward compatible helper for FC16."""
+
+        return await self._modbus_write_registers_fc(unit, address, values, 0x10)
+
+    async def read_data(
+        self,
+        unit: int,
+        address: int,
+        count: int,
+        data_type: DataType,
+    ) -> Optional[List[Union[int, bool]]]:
+        props = DATA_TYPE_PROPERTIES[data_type]
+        if props.read_function is None:
+            return None
+        if props.bit_based:
+            return await self._modbus_read_bits_fc(unit, address, count, props.read_function)
+        return await self._modbus_read_registers_fc(unit, address, count, props.read_function)
+
+    async def write_data(
+        self,
+        unit: int,
+        address: int,
+        values: Sequence[Union[int, bool]],
+        data_type: DataType,
+    ) -> bool:
+        props = DATA_TYPE_PROPERTIES[data_type]
+        if not props.writable or props.write_function is None:
+            return False
+        if props.bit_based:
+            bool_values = [bool(v) for v in values]
+            return await self._modbus_write_bits_fc(unit, address, bool_values, props.write_function)
+        int_values = [int(v) & 0xFFFF for v in values]
+        return await self._modbus_write_registers_fc(unit, address, int_values, props.write_function)
+
+    async def _send_modbus_request(self, unit: int, function: int, payload: bytes) -> Optional[bytes]:
         if not self.running:
             return None
 
-        # If we're using the ConnectionManager with a serial:// URI, some
-        # environments have trouble with pyserial-asyncio. Mirror the CLI
-        # behavior by using a blocking pymodbus serial client in a thread
-        # for reads when the URI is serial-based.
-        # If manager is present and manages the serial transport, use its
-        # blocking-send/receive helper so we don't open the serial device twice.
+        request = self._build_modbus_request(unit, function, payload)
+
+        frame: Optional[bytes] = None
         if self._use_manager and self._manager and self.uri and self.uri.startswith("serial://"):
+            # If we're running inside the asyncio event loop, prefer the
+            # manager's async send/receive helper to avoid using the
+            # thread-safe blocking wrapper which calls
+            # `asyncio.run_coroutine_threadsafe` (not allowed from the
+            # running loop). Use the async helper so GUI-initiated reads
+            # work correctly.
             try:
-                req = self._build_modbus_request(unit, 0x03, struct.pack('>HH', address, count))
-                # use ConnectionManager's blocking API to send and wait for response
-                frame = self._manager.send_and_receive_blocking(req, timeout=2.0)
+                frame = await self._manager._send_and_receive(request, timeout=2.0)
             except Exception:
-                logger.exception("modbus_read_holding_registers: manager blocking send/receive failed")
+                logger.exception("_send_modbus_request: manager async send/receive failed")
                 return None
+        else:
+            async with self.request_write_access():
+                await self.send_data(request)
+                try:
+                    frame = await asyncio.wait_for(self._read_one_frame(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    return None
 
-            success, payload = self._parse_modbus_response(frame, unit, 0x03)
-            if not success or payload is None:
-                return None
+        success, response_payload = self._parse_modbus_response(frame, unit, function)
+        if not success:
+            return None
+        return response_payload
 
-            if len(payload) < 1:
-                return None
-            byte_count = payload[0]
-            if len(payload) < 1 + byte_count:
-                return None
-
-            registers = []
-            for i in range(count):
-                offset = 1 + i * 2
-                if offset + 1 < len(payload):
-                    reg_val = struct.unpack('>H', payload[offset:offset+2])[0]
-                    registers.append(reg_val)
-            return registers
-
-        # Build FC03 request: address(2) + count(2)
-        data = struct.pack('>HH', address, count)
-        request = self._build_modbus_request(unit, 0x03, data)
-
-        async with self.request_write_access():
-            await self.send_data(request)
-            # Wait for response with timeout
-            try:
-                response = await asyncio.wait_for(self._read_one_frame(), timeout=2.0)
-            except asyncio.TimeoutError:
-                return None
-
-        success, payload = self._parse_modbus_response(response, unit, 0x03)
-        if not success or payload is None:
+    async def _modbus_read_registers_fc(
+        self, unit: int, address: int, count: int, function: int
+    ) -> Optional[List[int]]:
+        payload = await self._send_modbus_request(unit, function, struct.pack('>HH', address, count))
+        if payload is None:
             return None
 
-        # FC03 response: byte_count(1) + register_values(2*count)
         if len(payload) < 1:
             return None
         byte_count = payload[0]
         if len(payload) < 1 + byte_count:
             return None
 
-        registers = []
+        registers: List[int] = []
         for i in range(count):
             offset = 1 + i * 2
             if offset + 1 < len(payload):
-                reg_val = struct.unpack('>H', payload[offset:offset+2])[0]
-                registers.append(reg_val)
-
+                registers.append(struct.unpack('>H', payload[offset:offset+2])[0])
         return registers
 
-    async def modbus_write_registers(self, unit: int, address: int, values: List[int]) -> bool:
-        """Write multiple holding registers (FC16) using the shared transport.
+    async def _modbus_read_bits_fc(
+        self, unit: int, address: int, count: int, function: int
+    ) -> Optional[List[bool]]:
+        payload = await self._send_modbus_request(unit, function, struct.pack('>HH', address, count))
+        if payload is None:
+            return None
+        if len(payload) < 1:
+            return None
+        byte_count = payload[0]
+        if len(payload) < 1 + byte_count:
+            return None
 
-        Returns True on success, False on error.
-        """
-        if not self.running:
+        bits: List[bool] = []
+        data = payload[1:1 + byte_count]
+        for byte in data:
+            for bit_index in range(8):
+                if len(bits) >= count:
+                    break
+                bits.append(bool(byte & (1 << bit_index)))
+            if len(bits) >= count:
+                break
+        return bits
+
+    async def _modbus_write_registers_fc(
+        self, unit: int, address: int, values: Sequence[int], function: int
+    ) -> bool:
+        if not values:
             return False
-
         count = len(values)
         byte_count = count * 2
-        data = struct.pack('>HHB', address, count, byte_count)
-        for val in values:
-            data += struct.pack('>H', val)
+        payload = struct.pack('>HHB', address, count, byte_count)
+        for value in values:
+            payload += struct.pack('>H', value & 0xFFFF)
+        response = await self._send_modbus_request(unit, function, payload)
+        return response is not None
 
-        request = self._build_modbus_request(unit, 0x10, data)
+    async def _modbus_write_bits_fc(
+        self, unit: int, address: int, values: Sequence[bool], function: int
+    ) -> bool:
+        if not values:
+            return False
 
-        async with self.request_write_access():
-            await self.send_data(request)
-            try:
-                response = await asyncio.wait_for(self._read_one_frame(), timeout=2.0)
-            except asyncio.TimeoutError:
-                return False
+        byte_array = self._pack_coil_bytes(values)
+        payload = struct.pack('>HHB', address, len(values), len(byte_array)) + byte_array
+        response = await self._send_modbus_request(unit, function, payload)
+        return response is not None
 
-        success, payload = self._parse_modbus_response(response, unit, 0x10)
-        return success
+    def _pack_coil_bytes(self, values: Sequence[bool]) -> bytes:
+        buffer = bytearray()
+        current = 0
+        bit_idx = 0
+        for value in values:
+            if value:
+                current |= 1 << bit_idx
+            bit_idx += 1
+            if bit_idx == 8:
+                buffer.append(current)
+                current = 0
+                bit_idx = 0
+        if bit_idx:
+            buffer.append(current)
+        return bytes(buffer)
 
     async def _read_one_frame(self) -> bytes:
         """Read one complete Modbus frame from the transport.

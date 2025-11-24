@@ -2,7 +2,7 @@ import sys
 import os
 import asyncio
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Union
 from collections import deque
 from datetime import datetime
 
@@ -29,10 +29,16 @@ from PySide6.QtGui import QIcon, QBrush, QColor
 from PySide6.QtCore import Qt, QAbstractTableModel, QModelIndex
 from PySide6.QtWidgets import QTextEdit
 import qasync
-from umdt.core.controller import CoreController
+from umdt.core.data_types import (
+    DATA_TYPE_PROPERTIES,
+    DataType,
+    is_bit_type,
+    is_register_type,
+)
 from serial.tools import list_ports
 from urllib.parse import urlparse, parse_qs
 from umdt.utils.ieee754 import from_bytes_to_float16
+from umdt.utils.modbus_compat import call_read_method, call_write_method
 import logging
 import inspect
 
@@ -50,17 +56,20 @@ logger = logging.getLogger("umdt.gui")
 class ReadRow:
     index: str
     hex_value: str
-    int_value: int
+    int_value: Optional[int]
     float16: Optional[float]
+    data_type: DataType
+    bool_value: Optional[bool] = None
 
 
 @dataclass
 class MonitorSample:
     """A single monitor poll sample (one interval)."""
     timestamp: str
-    raw_registers: List[int]  # Raw 16-bit register values
+    raw_values: List[Union[int, bool]]
     address_start: int
     unit_id: int
+    data_type: DataType
     error: Optional[str] = None
 
 
@@ -71,16 +80,19 @@ class MonitorModel(QAbstractTableModel):
         super().__init__()
         self._samples: deque = deque(maxlen=max_samples)
         self._max_samples = max_samples
-        self._reg_count = 1
+        self._value_count = 1
         self._decoding = "Signed"  # Hex, Unsigned, Signed, Float16
         self._long_mode = False
         self._endian = "big"
 
-    def set_config(self, reg_count: int, long_mode: bool, endian: str):
-        """Configure register count and decoding parameters."""
-        self._reg_count = reg_count
+        self._data_type: DataType = DataType.HOLDING
+
+    def set_config(self, value_count: int, long_mode: bool, endian: str, data_type: DataType):
+        """Configure column count and decoding parameters."""
+        self._value_count = value_count
         self._long_mode = long_mode
         self._endian = endian
+        self._data_type = data_type
         self.update_headers()
 
     def set_decoding(self, decoding: str):
@@ -103,7 +115,7 @@ class MonitorModel(QAbstractTableModel):
 
     def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:  # type: ignore[override]
         # Timestamp + one column per register value
-        return 1 + self._reg_count
+        return 1 + self._value_count
 
     def data(self, index: QModelIndex, role: int = Qt.DisplayRole):  # type: ignore[override]
         if not index.isValid():
@@ -126,11 +138,15 @@ class MonitorModel(QAbstractTableModel):
 
             # Columns 1+: register values with selected decoding
             reg_idx = col - 1
-            if reg_idx >= len(sample.raw_registers):
+            if reg_idx >= len(sample.raw_values):
                 return ""
 
-            # Decode the register value based on current decoding mode
-            reg_val = sample.raw_registers[reg_idx]
+            # Decode value based on datatype/decoding mode
+            if is_bit_type(sample.data_type):
+                bit_val = bool(sample.raw_values[reg_idx])
+                return "ON" if bit_val else "OFF"
+
+            reg_val = int(sample.raw_values[reg_idx])
 
             if self._decoding == "Hex":
                 return f"0x{reg_val:04X}"
@@ -346,58 +362,32 @@ def encode_value_to_registers(
     return regs
 
 
-def run_gui_read(uri: str, address: int, count: int, long_mode: bool, endian: str, decode: bool) -> List[ReadRow]:
-    """Blocking worker that performs a simple Modbus read for the GUI.
-
-    For now this uses the first part of the URI to decide between serial and tcp
-    and mirrors the basic CLI read behavior for 16-bit registers.
+def run_gui_read(
+    uri: str,
+    address: int,
+    value_count: int,
+    long_mode: bool,
+    endian: str,
+    decode: bool,
+    data_type: DataType,
+    unit: int,
+) -> List[ReadRow]:
+    """Blocking worker to perform a Modbus read for the GUI.
+    
+    Raises RuntimeError with user-friendly messages on errors.
     """
-    # lazy import to avoid top-level pymodbus dependency issues
+
     from urllib.parse import urlparse, parse_qs
     try:
         from pymodbus.client import ModbusTcpClient, ModbusSerialClient
     except Exception:
         from pymodbus.client.sync import ModbusTcpClient, ModbusSerialClient  # type: ignore
 
-    def _read_holding_registers_compat(client, address: int, count: int, unit: int):
-        fn = client.read_holding_registers
-        try:
-            sig = inspect.signature(fn)
-            params = list(sig.parameters.keys())
-        except Exception:
-            params = []
-        try:
-            if 'count' in params and 'device_id' in params:
-                return fn(address, count=count, device_id=unit)
-            if 'count' in params and 'unit' in params:
-                return fn(address, count=count, unit=unit)
-            if 'count' in params and 'slave' in params:
-                return fn(address, count=count, slave=unit)
-            if 'count' in params and 'device' in params:
-                return fn(address, count=count, device=unit)
-            if 'count' in params and 'unit_id' in params:
-                return fn(address, count=count, unit_id=unit)
-        except TypeError:
-            pass
-        try:
-            if 'count' in params:
-                return fn(address, count=count)
-        except Exception:
-            pass
-        try:
-            return fn(address, count, unit)
-        except Exception:
-            try:
-                return fn(address, count)
-            except Exception:
-                raise
-
-    # debug logging removed for cleaner UI output
     parsed = urlparse(uri)
     scheme = parsed.scheme or "serial"
     qs = parse_qs(parsed.query or "")
-    unit = int(qs.get("unit", ["1"])[0])
 
+    # Parse connection details
     if scheme == "serial":
         netloc = parsed.netloc or parsed.path.lstrip("/")
         if ":" in netloc:
@@ -409,61 +399,136 @@ def run_gui_read(uri: str, address: int, count: int, long_mode: bool, endian: st
         else:
             port = netloc or qs.get("port", [""])[0]
             baud = int(qs.get("baud", ["9600"])[0])
-        # serial parse debug removed
-        client = ModbusSerialClient(port=port, baudrate=baud)
+        try:
+            client = ModbusSerialClient(port=port, baudrate=baud)
+        except Exception as e:
+            raise RuntimeError(f"Failed to create serial client for {port}: {e}")
     else:
         host = parsed.hostname or "127.0.0.1"
         tcp_port = parsed.port or int(qs.get("port", ["502"])[0])
-        client = ModbusTcpClient(host, port=tcp_port)
+        try:
+            client = ModbusTcpClient(host, port=tcp_port)
+        except Exception as e:
+            raise RuntimeError(f"Failed to create TCP client for {host}:{tcp_port}: {e}")
 
-    if not client.connect():
-        logger.error("run_gui_read: pymodbus client failed to connect (uri=%s)", uri)
-        raise RuntimeError("Failed to connect")
-
+    # Connect to device
     try:
-        if long_mode:
-            regs_to_read = max(1, count) * 2
+        connected = client.connect()
+    except Exception as e:
+        raise RuntimeError(f"Connection error: {e}")
+    
+    if not connected:
+        if scheme == "serial":
+            raise RuntimeError(f"Failed to connect to serial port {port} at {baud} baud. Check port name and permissions.")
         else:
-            regs_to_read = max(1, count)
+            raise RuntimeError(f"Failed to connect to {host}:{tcp_port}. Check host/port and network connectivity.")
 
-        rr = _read_holding_registers_compat(client, address, regs_to_read, unit)
-        if not hasattr(rr, "registers"):
-            logger.error("run_gui_read: read failed, response=%s", rr)
-            raise RuntimeError("Read failed")
-        regs = list(rr.registers)
-        # received registers debug removed
-    finally:
+    props = DATA_TYPE_PROPERTIES[data_type]
+    if not props.readable or not props.pymodbus_read_method:
         client.close()
+        raise RuntimeError(f"Data type {data_type.value} cannot be read")
 
-    # Decode results according to requested mode
-    import struct
+    total_count = value_count
+    if is_register_type(data_type):
+        total_count = max(1, value_count) * (2 if long_mode else 1)
+    else:
+        total_count = max(1, value_count)
 
-    # normalize 'all' to 'big' for now
+    # Perform read
+    try:
+        response = call_read_method(client, props.pymodbus_read_method, address, total_count, unit)
+    except Exception as e:
+        client.close()
+        raise RuntimeError(f"Modbus read error: {e}")
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+    # Check response for protocol errors
+    if hasattr(response, 'isError') and response.isError():
+        # Try to extract exception code for better error messages
+        error_msg = "Modbus protocol error"
+        if hasattr(response, 'exception_code'):
+            code = response.exception_code
+            error_codes = {
+                1: "Illegal function",
+                2: "Illegal data address",
+                3: "Illegal data value",
+                4: "Slave device failure",
+                5: "Acknowledge (request accepted, processing)",
+                6: "Slave device busy",
+                8: "Memory parity error",
+                10: "Gateway path unavailable",
+                11: "Gateway target device failed to respond",
+            }
+            error_msg = f"Modbus exception {code}: {error_codes.get(code, 'Unknown error')}"
+        raise RuntimeError(error_msg)
+
+    # Extract values from response
+    values = None
+    attr = 'bits' if is_bit_type(data_type) else 'registers'
+    values = getattr(response, attr, None)
+    if values is None:
+        try:
+            values = list(response)
+        except Exception:
+            values = []
+    
+    if not values:
+        raise RuntimeError(f"Read returned no data. Check address {address} and unit ID {unit}.")
+
+    return _build_rows_from_values(values, data_type, address, value_count, long_mode, endian, decode)
+
+
+def _build_rows_from_values(
+    values: List[Union[int, bool]],
+    data_type: DataType,
+    address: int,
+    value_count: int,
+    long_mode: bool,
+    endian: str,
+    decode: bool,
+) -> List[ReadRow]:
+    rows: List[ReadRow] = []
     e_norm = endian if endian != "all" else "big"
 
-    rows: List[ReadRow] = []
+    if is_bit_type(data_type):
+        for i, bit in enumerate(values[:value_count]):
+            idx = str(address + i)
+            state = bool(bit)
+            rows.append(
+                ReadRow(
+                    index=idx,
+                    hex_value="—",
+                    int_value=1 if state else 0,
+                    float16=None,
+                    data_type=data_type,
+                    bool_value=state,
+                )
+            )
+        return rows
+
+    regs = [int(v) & 0xFFFF for v in values]
+    import struct
+
     if long_mode and decode:
-        # combine pairs into 32-bit values
-        for i in range(max(1, count)):
+        for i in range(max(1, value_count)):
             ri = i * 2
             if ri + 1 >= len(regs):
                 break
-            r1 = regs[ri]
-            r2 = regs[ri + 1]
-            b1 = int(r1).to_bytes(2, byteorder="big", signed=False)
-            b2 = int(r2).to_bytes(2, byteorder="big", signed=False)
+            b1 = regs[ri].to_bytes(2, byteorder="big")
+            b2 = regs[ri + 1].to_bytes(2, byteorder="big")
             bv = b1 + b2
-
-            # apply same transform used in encoding (self-inverse)
             if e_norm == "big":
                 raw_be = bv
             elif e_norm == "little":
                 raw_be = bv[::-1]
             elif e_norm == "mid-big":
                 raw_be = bytes([bv[2], bv[3], bv[0], bv[1]])
-            else:  # mid-little
+            else:
                 raw_be = bytes([bv[1], bv[0], bv[3], bv[2]])
-
             try:
                 i32 = int.from_bytes(raw_be, byteorder="big", signed=True)
             except Exception:
@@ -472,28 +537,38 @@ def run_gui_read(uri: str, address: int, count: int, long_mode: bool, endian: st
                 f32 = struct.unpack("!f", raw_be)[0]
             except Exception:
                 f32 = None
-
             hexv = "0x" + bv.hex().upper()
-            rows.append(ReadRow(index=str(address + ri), hex_value=hexv, int_value=i32, float16=f32))
+            rows.append(
+                ReadRow(
+                    index=str(address + ri),
+                    hex_value=hexv,
+                    int_value=i32,
+                    float16=f32,
+                    data_type=data_type,
+                )
+            )
         return rows
 
-    # 16-bit decode (or non-decode fallback)
-    for i, r in enumerate(regs):
-        idx_disp = str(address + i)
-        b = int(r).to_bytes(2, byteorder="big", signed=False)
+    for i, r in enumerate(regs[: value_count * (2 if long_mode else 1)]):
+        idx = str(address + i)
+        b = r.to_bytes(2, byteorder="big", signed=False)
         hexv = "0x" + b.hex().upper()
-
-        # apply endian for single-register interpretations
         bb = b[::-1] if e_norm == "little" else b
-
-        # signed int16
         u = int.from_bytes(bb, byteorder="big", signed=False)
         i16 = u if u < 0x8000 else u - 0x10000
         try:
             f16 = from_bytes_to_float16(bb)
         except Exception:
             f16 = None
-        rows.append(ReadRow(index=idx_disp, hex_value=hexv, int_value=i16, float16=f16))
+        rows.append(
+            ReadRow(
+                index=idx,
+                hex_value=hexv,
+                int_value=i16,
+                float16=f16,
+                data_type=data_type,
+            )
+        )
     return rows
 
 
@@ -505,6 +580,8 @@ def run_gui_write(
     float_mode: bool,
     signed: bool,
     value_text: str,
+    data_type: DataType,
+    unit: int,
 ) -> tuple[bool, str]:
     """Blocking worker that performs a simple Modbus write for the GUI.
 
@@ -666,11 +743,16 @@ def run_gui_write(
                 bv = bv[::-1]
             regs = [int.from_bytes(bv, byteorder="big")]
 
+    # Validate data type is writable
+    props = DATA_TYPE_PROPERTIES[data_type]
+    if not props.writable or not props.pymodbus_write_method:
+        raise RuntimeError(f"Data type {data_type.value} cannot be written")
+
     parsed = urlparse(uri)
     scheme = parsed.scheme or "serial"
     qs = parse_qs(parsed.query or "")
-    unit = int(qs.get("unit", ["1"])[0])
 
+    # Create client
     if scheme == "serial":
         netloc = parsed.netloc or parsed.path.lstrip("/")
         if ":" in netloc:
@@ -682,25 +764,86 @@ def run_gui_write(
         else:
             port = netloc or qs.get("port", [""])[0]
             baud = int(qs.get("baud", ["9600"])[0])
-        client = ModbusSerialClient(port=port, baudrate=baud)
+        try:
+            client = ModbusSerialClient(port=port, baudrate=baud)
+        except Exception as e:
+            raise RuntimeError(f"Failed to create serial client for {port}: {e}")
     else:
         host = parsed.hostname or "127.0.0.1"
         tcp_port = parsed.port or int(qs.get("port", ["502"])[0])
-        client = ModbusTcpClient(host, port=tcp_port)
+        try:
+            client = ModbusTcpClient(host, port=tcp_port)
+        except Exception as e:
+            raise RuntimeError(f"Failed to create TCP client for {host}:{tcp_port}: {e}")
 
-    if not client.connect():
-        raise RuntimeError("Failed to connect")
-
+    # Connect
     try:
-        if long_mode or (float_mode and len(regs) == 2):
-            res = _write_registers_compat(client, address, regs, unit)
+        connected = client.connect()
+    except Exception as e:
+        raise RuntimeError(f"Connection error: {e}")
+    
+    if not connected:
+        if scheme == "serial":
+            raise RuntimeError(f"Failed to connect to serial port {port} at {baud} baud. Check port name and permissions.")
         else:
-            res = _write_register_compat(client, address, regs[0], unit)
+            raise RuntimeError(f"Failed to connect to {host}:{tcp_port}. Check host/port and network connectivity.")
+
+    # Perform write using data type specific method
+    try:
+        # For coils, convert register values to boolean list
+        if data_type == DataType.COIL:
+            # Convert register values to boolean list
+            bit_values = []
+            for reg in regs:
+                # Extract bits from register
+                for bit_pos in range(16):
+                    if len(bit_values) >= (1 if not long_mode else 32):
+                        break
+                    bit_values.append(bool((reg >> bit_pos) & 1))
+            # If single bit, use write_coil, else write_coils
+            if len(bit_values) == 1:
+                res = call_write_method(client, 'write_coil', address, bit_values[0], unit)
+            else:
+                res = call_write_method(client, 'write_coils', address, bit_values, unit)
+        else:
+            # For registers, use appropriate write method
+            if long_mode or (float_mode and len(regs) == 2) or len(regs) > 1:
+                res = call_write_method(client, props.pymodbus_write_method, address, regs, unit)
+            else:
+                # Single register write
+                if props.pymodbus_write_method == 'write_registers':
+                    res = call_write_method(client, 'write_register', address, regs[0], unit)
+                else:
+                    res = call_write_method(client, props.pymodbus_write_method, address, regs, unit)
+        
+        # Check for protocol errors
         if hasattr(res, "isError") and res.isError():
-            return False, "Write failed"
+            error_msg = "Modbus protocol error"
+            if hasattr(res, 'exception_code'):
+                code = res.exception_code
+                error_codes = {
+                    1: "Illegal function",
+                    2: "Illegal data address",
+                    3: "Illegal data value",
+                    4: "Slave device failure",
+                    5: "Acknowledge (request accepted, processing)",
+                    6: "Slave device busy",
+                    8: "Memory parity error",
+                    10: "Gateway path unavailable",
+                    11: "Gateway target device failed to respond",
+                }
+                error_msg = f"Modbus exception {code}: {error_codes.get(code, 'Unknown error')}"
+            raise RuntimeError(error_msg)
         return True, "Write OK"
+    except RuntimeError:
+        raise
+    except Exception as e:
+        raise RuntimeError(f"Modbus write error: {e}")
     finally:
-        client.close()
+        try:
+            client.close()
+        except Exception:
+            pass
 
 # project icon (placed next to main scripts)
 ICON_PATH = os.path.join(os.path.dirname(__file__), "umdt.ico")
@@ -771,6 +914,20 @@ class MainWindow(QMainWindow):
         conn_row.addWidget(self.unit_label)
         conn_row.addWidget(self.unit_edit)
 
+        self.datatype_combo = QComboBox()
+        for dtype in (DataType.HOLDING, DataType.INPUT, DataType.COIL, DataType.DISCRETE):
+            props = DATA_TYPE_PROPERTIES[dtype]
+            self.datatype_combo.addItem(props.label)
+        # Store mapping separately since QComboBox userData can be unreliable
+        self._datatype_map = {
+            0: DataType.HOLDING,
+            1: DataType.INPUT,
+            2: DataType.COIL,
+            3: DataType.DISCRETE,
+        }
+        conn_row.addWidget(QLabel("Type:"))
+        conn_row.addWidget(self.datatype_combo)
+
         self.btn_connect = QPushButton("Connect")
         self.btn_connect.clicked.connect(self.on_connect_clicked)
         conn_row.addWidget(self.btn_connect)
@@ -808,18 +965,12 @@ class MainWindow(QMainWindow):
         self.log_view.setMaximumHeight(160)
         root_layout.addWidget(self.log_view)
 
-        # Initialize CoreController with placeholder URI; real URI will be
-        # built from the connection panel when connecting.
-        self.controller = CoreController(uri=None)
         # Async lock to prevent concurrent read operations
         self._read_lock = asyncio.Lock()
         # Monitor polling task
         self._monitor_task: Optional[asyncio.Task] = None
-        # observe controller status/log entries to update UI live
-        try:
-            self.controller.add_observer(self._on_controller_entry)
-        except Exception:
-            pass
+        # Store connection state: None = disconnected, str = URI
+        self._connection_uri: Optional[str] = None
 
     # --- Intent helpers ---
 
@@ -854,6 +1005,10 @@ class MainWindow(QMainWindow):
             return int(text.strip(), 0)
         except Exception:
             return None
+
+    def _current_data_type(self) -> DataType:
+        idx = self.datatype_combo.currentIndex()
+        return self._datatype_map.get(idx, DataType.HOLDING)
 
     def _build_interact_tab(self) -> None:
         layout = QVBoxLayout()
@@ -1088,109 +1243,19 @@ class MainWindow(QMainWindow):
 
     @qasync.asyncSlot()
     async def on_connect_clicked(self):
-        # Determine current connected state: either controller running or a direct serial URI set
-        controller_running = getattr(self, 'controller', None) and getattr(self.controller, 'running', False)
-        serial_direct = getattr(self, '_direct_serial_uri', None) is not None
-        is_connected = bool(controller_running or serial_direct)
-
-        if not is_connected:
-            # reconfigure controller URI before starting
+        if self._connection_uri is None:
+            # Connect: store URI for use by read/write operations
             uri = self.build_uri()
-            conn_type = self.conn_type_combo.currentText().lower()
-
-            # For serial connections prefer the blocking pymodbus client (CLI pattern)
-            # rather than starting the async ConnectionManager which opens the serial
-            # port with pyserial-asyncio (causes port sharing issues). We store the
-            # serial URI and use the fallback read/write workers instead of starting
-            # the controller.
-            if conn_type == 'serial':
-                self._direct_serial_uri = uri
-                self.status_label.setText("Ready (serial)")
-                self.btn_connect.setText("Disconnect")
-            else:
-                # recreate controller with new URI and start it
-                self.controller = CoreController(uri=uri)
-                try:
-                    self.controller.add_observer(self._on_controller_entry)
-                except Exception:
-                    pass
-                # start controller in background so UI doesn't block
-                self.status_label.setText("Connecting...")
-                self.btn_connect.setText("Disconnect")
-                # create background task to start controller (does not block UI)
-                self._start_task = asyncio.create_task(self.controller.start())
-
-                # If using the ConnectionManager, wait briefly for the manager to signal connected
-                if getattr(self.controller, '_use_manager', False) and getattr(self.controller, '_manager', None):
-                    try:
-                        await asyncio.wait_for(self.controller._manager._connected_event.wait(), timeout=0.5)
-                        self.status_label.setText("Connected")
-                    except Exception:
-                        # leave status as Connecting...; manager will notify later via controller callbacks
-                        pass
+            self._connection_uri = uri
+            self.status_label.setText("Connected")
+            self.btn_connect.setText("Disconnect")
         else:
-            self.status_label.setText("Disconnecting...")
-            try:
-                # if we used direct serial fallback, just clear that state
-                if getattr(self, '_direct_serial_uri', None):
-                    self._direct_serial_uri = None
-                # stop controller if running
-                if getattr(self.controller, 'running', False):
-                    await self.controller.stop()
-            finally:
-                # Ensure UI shows disconnected state
-                self.status_label.setText("Disconnected")
-                self.btn_connect.setText("Connect")
+            # Disconnect: clear stored URI
+            self._connection_uri = None
+            self.status_label.setText("Disconnected")
+            self.btn_connect.setText("Connect")
 
-    def _on_controller_entry(self, entry: dict):
-        """Observer callback for controller entries (logs/status).
 
-        Expects entries with 'direction' and 'data'. Update the status label
-        when receiving STATUS notifications from ConnectionManager.
-        """
-        try:
-            if not isinstance(entry, dict):
-                return
-            if entry.get("direction") == "STATUS":
-                data = entry.get("data", "")
-                # Update UI label; this is called from the asyncio loop integrated
-                # with Qt via qasync, so direct widget updates are safe.
-                try:
-                    text = str(data)
-                    self.status_label.setText(text)
-                    # Color-code status: green for connected/ready, red for errors
-                    s = text.lower()
-                    if "connected" in s or "ready" in s or "ok" in s:
-                        self.status_label.setStyleSheet("color: darkgreen")
-                    elif "error" in s or "failed" in s or "connect error" in s:
-                        self.status_label.setStyleSheet("color: darkred")
-                    else:
-                        self.status_label.setStyleSheet("")
-                except Exception:
-                    pass
-
-                # If the manager signals a connect error, show a popup with guidance
-                try:
-                    s = str(data).lower()
-                    # Append to log view for visibility
-                    try:
-                        self.log_view.append(f"STATUS: {s}")
-                    except Exception:
-                        pass
-                    if "connect error" in s or "no module named" in s:
-                        # show a warning with install hint if serial_asyncio missing
-                        if "serial_async" in s or "serial_asyncio" in s:
-                            QMessageBox.warning(
-                                self,
-                                "Connection error",
-                                "Serial transport failed: 'pyserial-asyncio' is required.\nInstall with: pip install pyserial-asyncio",
-                            )
-                        else:
-                            QMessageBox.warning(self, "Connection error", str(data))
-                except Exception:
-                    pass
-        except Exception:
-            pass
 
     def on_conn_type_changed(self, index: int | None = None):
         """Show/hide serial vs TCP input widgets based on the selected connection type."""
@@ -1245,10 +1310,7 @@ class MainWindow(QMainWindow):
             return
 
         # Require explicit Connect action from the top-bar before allowing reads.
-        # For serial connections the top-bar Connect sets `_direct_serial_uri`.
-        controller_running = getattr(self, 'controller', None) and getattr(self.controller, 'running', False)
-        serial_direct = getattr(self, '_direct_serial_uri', None) is not None
-        if not (controller_running or serial_direct):
+        if self._connection_uri is None:
             QMessageBox.warning(self, "Not connected", "Please use the Connect button in the top bar to establish a connection before reading.")
             return
 
@@ -1266,151 +1328,84 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
             try:
-                count = self._parse_int(self.read_count_edit.text()) or 1
+                value_count = self._parse_int(self.read_count_edit.text()) or 1
+                if value_count <= 0:
+                    QMessageBox.warning(self, "Invalid count", "Enter a positive count of values to read.")
+                    return
+
+                data_type = self._current_data_type()
                 long_mode = self.read_long_checkbox.isChecked()
+                if is_bit_type(data_type) and long_mode:
+                    QMessageBox.warning(self, "Unsupported", "32-bit decoding is only available for register-based data types.")
+                    return
+
                 e_norm = self._normalize_endian(self.read_endian_combo.currentText(), allow_all=True)
                 if e_norm is None:
                     QMessageBox.warning(self, "Invalid endian", "Select a valid endian option.")
                     return
 
-                # Get unit ID from connection panel
                 unit = self._parse_int(self.unit_edit.text()) or 1
 
-                # Determine register count to read
-                regs_to_read = count * 2 if long_mode else count
-
-                # read invocation debug removed
-
-                # Check if we can use the running controller's transport
-                if getattr(self, 'controller', None) and getattr(self.controller, 'running', False):
-                    # Check if transport is actually connected
-                    if self.controller._use_manager and self.controller._manager:
-                        if not self.controller._manager._connected_event.is_set():
-                            QMessageBox.warning(self, "Not connected", "Controller is starting; wait for connection to complete.")
-                            return
-                    # Use CoreController Modbus methods (shared transport)
-                    try:
-                        regs = await self.controller.modbus_read_holding_registers(unit, addr, regs_to_read)
-                        if regs is None:
-                            QMessageBox.critical(self, "Read error", "Modbus read failed (timeout or error response)")
-                            return
-                        if len(regs) == 0:
-                            QMessageBox.information(self, "No registers", "Read returned no registers.")
-                            self.read_model.update_rows([])
-                            self.status_label.setText("No registers")
-                            return
-                    except Exception as exc:
-                        logger.exception("_perform_read: controller read exception")
-                        QMessageBox.critical(self, "Read error", str(exc))
+                # Validate Modbus PDU limits
+                if is_register_type(data_type):
+                    raw_regs = value_count * (2 if long_mode else 1)
+                    if raw_regs > 125:
+                        QMessageBox.warning(self, "Too many registers", "Modbus only allows up to 125 registers per request.")
                         return
                 else:
-                    # Fall back to standalone pymodbus client
-                    uri = self.build_uri()
-                    # Basic validation: ensure serial port or host present in URI
-                    parsed = urlparse(uri)
-                    scheme = parsed.scheme or 'serial'
-                    if scheme == 'serial':
-                        port = parsed.netloc or parsed.path.lstrip('/')
-                        # strip optional baud portion if present
-                        if ':' in port:
-                            port = port.split(':', 1)[0]
-                        if not port:
-                            QMessageBox.warning(self, "Missing port", "Select or enter a serial port before reading.")
-                            return
-                    else:
-                        host = parsed.hostname
-                        if not host:
-                            QMessageBox.warning(self, "Missing host", "Enter a TCP host before reading.")
-                            return
-
-                    # Run blocking Modbus read in thread to avoid blocking the GUI
-                    # indicate activity
-                    self.status_label.setText("Reading...")
-                    try:
-                        rows = await self._read_registers(uri, addr, count, long_mode, e_norm, decode, unit)
-                    except Exception as exc:
-                        logger.exception("_perform_read: fallback read exception")
-                        QMessageBox.critical(self, "Read error", str(exc))
-                        self.status_label.setText("Read error")
+                    if value_count > 2000:
+                        QMessageBox.warning(self, "Too many bits", "Modbus only allows up to 2000 coils/inputs per request.")
                         return
 
-                    if not rows:
-                        QMessageBox.information(self, "No registers", "Read returned no registers.")
-                        self.read_model.update_rows([])
-                        self.status_label.setText("No registers")
-                        return
+                self.status_label.setText("Reading...")
 
-                    self.read_model.update_rows(rows)
-                    self.status_label.setText(f"Read {len(rows)} rows")
+                try:
+                    rows = await self._read_rows(
+                        addr,
+                        value_count,
+                        long_mode,
+                        e_norm,
+                        decode,
+                        data_type,
+                        unit,
+                        self._connection_uri,
+                    )
+                except RuntimeError as exc:
+                    # RuntimeError from run_gui_read contains user-friendly message
+                    logger.error("Read failed: %s", exc)
+                    QMessageBox.critical(self, "Read Error", str(exc))
+                    self.status_label.setText("Read error")
+                    self.status_label.setStyleSheet("color: darkred")
                     try:
-                        self.status_label.setStyleSheet("")
-                        self.log_view.append(f"READ: addr={addr} count={count} long={long_mode} rows={len(rows)}")
+                        self.log_view.append(f"READ ERROR: {exc}")
                     except Exception:
                         pass
                     return
+                except Exception as exc:
+                    # Unexpected error - log full traceback
+                    logger.exception("_perform_read: unexpected error")
+                    QMessageBox.critical(self, "Unexpected Error", f"An unexpected error occurred: {exc}")
+                    self.status_label.setText("Read error")
+                    self.status_label.setStyleSheet("color: darkred")
+                    return
 
-                # Process registers from controller read
-                import struct
-
-                e_norm = e_norm if e_norm != "all" else "big"
-
-                rows: List[ReadRow] = []
-                if long_mode and decode:
-                    # combine pairs into 32-bit values
-                    for i in range(max(1, count)):
-                        ri = i * 2
-                        if ri + 1 >= len(regs):
-                            break
-                        r1 = regs[ri]
-                        r2 = regs[ri + 1]
-                        b1 = int(r1).to_bytes(2, byteorder="big", signed=False)
-                        b2 = int(r2).to_bytes(2, byteorder="big", signed=False)
-                        bv = b1 + b2
-
-                        if e_norm == "big":
-                            raw_be = bv
-                        elif e_norm == "little":
-                            raw_be = bv[::-1]
-                        elif e_norm == "mid-big":
-                            raw_be = bytes([bv[2], bv[3], bv[0], bv[1]])
-                        else:
-                            raw_be = bytes([bv[1], bv[0], bv[3], bv[2]])
-
-                        try:
-                            i32 = int.from_bytes(raw_be, byteorder="big", signed=True)
-                        except Exception:
-                            i32 = 0
-                        try:
-                            f32 = struct.unpack("!f", raw_be)[0]
-                        except Exception:
-                            f32 = None
-
-                        hexv = "0x" + bv.hex().upper()
-                        rows.append(ReadRow(index=str(addr + ri), hex_value=hexv, int_value=i32, float16=f32))
-                else:
-                    for i, r in enumerate(regs):
-                        idx_disp = str(addr + i)
-                        b = int(r).to_bytes(2, byteorder="big", signed=False)
-                        hexv = "0x" + b.hex().upper()
-
-                        bb = b[::-1] if e_norm == "little" else b
-
-                        u = int.from_bytes(bb, byteorder="big", signed=False)
-                        i16 = u if u < 0x8000 else u - 0x10000
-                        try:
-                            f16 = from_bytes_to_float16(bb)
-                        except Exception:
-                            f16 = None
-                        rows.append(ReadRow(index=idx_disp, hex_value=hexv, int_value=i16, float16=f16))
+                if not rows:
+                    QMessageBox.information(self, "No data", "Read returned no values.")
+                    self.read_model.update_rows([])
+                    self.status_label.setText("No data")
+                    return
 
                 self.read_model.update_rows(rows)
                 self.status_label.setText(f"Read {len(rows)} rows")
                 try:
                     self.status_label.setStyleSheet("")
-                    self.log_view.append(f"READ: addr={addr} count={count} long={long_mode} rows={len(rows)}")
+                    props = DATA_TYPE_PROPERTIES[data_type]
+                    func_code = props.read_function
+                    self.log_view.append(
+                        f"READ: type={props.label} (func=0x{func_code:02X}) addr={addr} count={value_count} long={long_mode} rows={len(rows)}"
+                    )
                 except Exception:
                     pass
-                # clear details when new read results appear
                 try:
                     self.read_details.clear()
                 except Exception:
@@ -1429,9 +1424,7 @@ class MainWindow(QMainWindow):
             return
 
         # Require explicit Connect action from the top-bar before allowing writes.
-        controller_running = getattr(self, 'controller', None) and getattr(self.controller, 'running', False)
-        serial_direct = getattr(self, '_direct_serial_uri', None) is not None
-        if not (controller_running or serial_direct):
+        if self._connection_uri is None:
             QMessageBox.warning(self, "Not connected", "Please use the Connect button in the top bar to establish a connection before writing.")
             return
 
@@ -1448,8 +1441,15 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Missing value", "Enter a value to write.")
             return
 
-        # Get unit ID from connection panel
+        # Get unit ID and data type from connection panel
         unit = self._parse_int(self.unit_edit.text()) or 1
+        data_type = self._current_data_type()
+
+        # Validate data type is writable
+        props = DATA_TYPE_PROPERTIES[data_type]
+        if not props.writable:
+            QMessageBox.warning(self, "Not writable", f"Data type {props.label} cannot be written.")
+            return
 
         # Build register payload using CLI-style encoding
         try:
@@ -1458,54 +1458,31 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Validation error", str(ve))
             return
 
-        # Check if we can use the running controller's transport
-        if getattr(self, 'controller', None) and getattr(self.controller, 'running', False):
-            # Check if transport is actually connected
-            if self.controller._use_manager and self.controller._manager:
-                if not self.controller._manager._connected_event.is_set():
-                    QMessageBox.warning(self, "Not connected", "Controller is starting; wait for connection to complete.")
-                    return
-            # Use CoreController Modbus methods (shared transport)
-            try:
-                success = await self.controller.modbus_write_registers(unit, addr, regs)
-                if success:
-                    self.write_status_label.setText("Write OK")
-                else:
-                    self.write_status_label.setText("Write failed")
-            except Exception as exc:
-                QMessageBox.critical(self, "Write error", str(exc))
-            return
-        else:
-            # Fall back to standalone pymodbus client
-            uri = self.build_uri()
-            # Basic validation similar to read
-            parsed = urlparse(uri)
-            scheme = parsed.scheme or 'serial'
-            if scheme == 'serial':
-                port = parsed.netloc or parsed.path.lstrip('/')
-                if ':' in port:
-                    port = port.split(':', 1)[0]
-                if not port:
-                    QMessageBox.warning(self, "Missing port", "Select or enter a serial port before writing.")
-                    return
-            else:
-                host = parsed.hostname
-                if not host:
-                    QMessageBox.warning(self, "Missing host", "Enter a TCP host before writing.")
-                    return
-
-            try:
-                ok = await self._write_registers(uri, addr, unit, regs)
-            except Exception as exc:
-                logger.exception("_perform_write: fallback write exception")
-                QMessageBox.critical(self, "Write error", str(exc))
-                return
-
+        # Use standalone blocking client for write
+        try:
+            ok = await self._write_registers(self._connection_uri, addr, unit, regs, data_type, long_mode, e_norm, float_mode, signed)
             self.write_status_label.setText("Write OK" if ok else "Write failed")
+            self.write_status_label.setStyleSheet("color: darkgreen" if ok else "color: darkred")
             try:
                 self.log_view.append(f"WRITE: addr={addr} unit={unit} values={regs} ok={ok}")
             except Exception:
                 pass
+        except RuntimeError as exc:
+            # RuntimeError from run_gui_write contains user-friendly message
+            logger.error("Write failed: %s", exc)
+            QMessageBox.critical(self, "Write Error", str(exc))
+            self.write_status_label.setText("Write error")
+            self.write_status_label.setStyleSheet("color: darkred")
+            try:
+                self.log_view.append(f"WRITE ERROR: {exc}")
+            except Exception:
+                pass
+        except Exception as exc:
+            # Unexpected error - log full traceback
+            logger.exception("_perform_write: unexpected error")
+            QMessageBox.critical(self, "Unexpected Error", f"An unexpected error occurred: {exc}")
+            self.write_status_label.setText("Write error")
+            self.write_status_label.setStyleSheet("color: darkred")
 
     # --- Monitor tab slots ---
 
@@ -1571,92 +1548,51 @@ class MainWindow(QMainWindow):
 
         return "\n".join(lines)
 
-    async def _read_registers(self, uri: str, addr: int, count: int, long_mode: bool, endian: str, decode: bool, unit: int) -> Optional[List[ReadRow]]:
-        """Unified read helper for the GUI.
-
-        Prefers `CoreController.modbus_read_holding_registers` when the controller
-        is running (which already manages locking). Falls back to the blocking
-        `run_gui_read` executed in a thread when no controller is available.
+    async def _read_rows(
+        self,
+        addr: int,
+        value_count: int,
+        long_mode: bool,
+        endian: str,
+        decode: bool,
+        data_type: DataType,
+        unit: int,
+        uri: Optional[str] = None,
+    ) -> Optional[List[ReadRow]]:
+        """Read values via standalone blocking client and return table rows.
+        
+        Raises RuntimeError with user-friendly message on errors.
         """
-        # If controller is running, prefer its read helper which is async and
-        # acquires transport locks correctly.
-        if getattr(self, 'controller', None) and getattr(self.controller, 'running', False):
-            regs = await self.controller.modbus_read_holding_registers(unit, addr, count * (2 if long_mode else 1))
-            if regs is None:
-                return None
-            # Convert to ReadRow list similar to run_gui_read when decode requested
-            if long_mode and decode:
-                rows: List[ReadRow] = []
-                import struct
-                for i in range(max(1, count)):
-                    ri = i * 2
-                    if ri + 1 >= len(regs):
-                        break
-                    r1 = regs[ri]
-                    r2 = regs[ri + 1]
-                    b1 = int(r1).to_bytes(2, byteorder="big", signed=False)
-                    b2 = int(r2).to_bytes(2, byteorder="big", signed=False)
-                    bv = b1 + b2
-                    # respect endian argument (normalize 'all' to big)
-                    e_norm = endian if endian != "all" else "big"
-                    if e_norm == "big":
-                        raw_be = bv
-                    elif e_norm == "little":
-                        raw_be = bv[::-1]
-                    elif e_norm == "mid-big":
-                        raw_be = bytes([bv[2], bv[3], bv[0], bv[1]])
-                    else:
-                        raw_be = bytes([bv[1], bv[0], bv[3], bv[2]])
-                    try:
-                        i32 = int.from_bytes(raw_be, byteorder="big", signed=True)
-                    except Exception:
-                        i32 = 0
-                    try:
-                        f32 = struct.unpack("!f", raw_be)[0]
-                    except Exception:
-                        f32 = None
-                    hexv = "0x" + bv.hex().upper()
-                    rows.append(ReadRow(index=str(addr + ri), hex_value=hexv, int_value=i32, float16=f32))
-                return rows
-            else:
-                rows: List[ReadRow] = []
-                for i, r in enumerate(regs):
-                    idx_disp = str(addr + i)
-                    b = int(r).to_bytes(2, byteorder="big", signed=False)
-                    hexv = "0x" + b.hex().upper()
-                    e_norm = endian if endian != "all" else "big"
-                    bb = b[::-1] if e_norm == "little" else b
-                    u = int.from_bytes(bb, byteorder="big", signed=False)
-                    i16 = u if u < 0x8000 else u - 0x10000
-                    try:
-                        f16 = from_bytes_to_float16(bb)
-                    except Exception:
-                        f16 = None
-                    rows.append(ReadRow(index=idx_disp, hex_value=hexv, int_value=i16, float16=f16))
-                return rows
+        if uri is None:
+            uri = self._connection_uri or self.build_uri()
+        return await asyncio.to_thread(
+            run_gui_read,
+            uri,
+            addr,
+            value_count,
+            long_mode,
+            endian,
+            decode,
+            data_type,
+            unit,
+        )
 
-        # Fallback: run blocking pymodbus read in a thread
-        try:
-            return await asyncio.to_thread(run_gui_read, uri, addr, count, long_mode, endian, decode)
-        except Exception:
-            logger.exception("_read_registers: fallback run_gui_read failed")
-            return None
+    async def _write_registers(self, uri: str, addr: int, unit: int, values: List[int], data_type: DataType, long_mode: bool, endian: str, float_mode: bool, signed: bool) -> bool:
+        """Write values using standalone blocking client.
+        
+        Raises RuntimeError with user-friendly message on errors.
+        """
+        # Construct value text from values list
+        if len(values) == 1:
+            value_text = str(values[0])
+        else:
+            # For multi-register, use first value (caller should have encoded properly)
+            value_text = str(values[0] if values else 0)
+        
+        ok, _ = await asyncio.to_thread(run_gui_write, uri, addr, long_mode, endian, float_mode, signed, value_text, data_type, unit)
+        return ok
 
-    async def _write_registers(self, uri: str, addr: int, unit: int, values: List[int]) -> bool:
-        """Unified write helper for GUI: prefer controller, fall back to blocking write."""
-        if getattr(self, 'controller', None) and getattr(self.controller, 'running', False):
-            try:
-                return await self.controller.modbus_write_registers(unit, addr, values)
-            except Exception:
-                logger.exception("_write_registers: controller write failed")
-                return False
 
-        try:
-            ok, _ = await asyncio.to_thread(run_gui_write, uri, addr, len(values) > 1, 'big', False, False, str(values[0] if values else 0))
-            return ok
-        except Exception:
-            logger.exception("_write_registers: fallback run_gui_write failed")
-            return False
 
     def _compute_decoding_rows(self, regs: List[int]) -> List[dict]:
         """Return a list of decoding dicts for each endianness.
@@ -1898,9 +1834,7 @@ class MainWindow(QMainWindow):
     async def on_monitor_start_clicked(self):
         """Start the monitor polling task."""
         # Require connection first
-        controller_running = getattr(self, 'controller', None) and getattr(self.controller, 'running', False)
-        serial_direct = getattr(self, '_direct_serial_uri', None) is not None
-        if not (controller_running or serial_direct):
+        if self._connection_uri is None:
             QMessageBox.warning(self, "Not connected", "Please use the Connect button in the top bar to establish a connection before monitoring.")
             return
 
@@ -1971,23 +1905,19 @@ class MainWindow(QMainWindow):
                 poll_count += 1
                 timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
 
-                # Attempt to read registers
+                # Attempt to read registers using standalone blocking client
                 try:
-                    # Check if we can use the running controller's transport
-                    if getattr(self, 'controller', None) and getattr(self.controller, 'running', False):
-                        # Use CoreController Modbus methods
-                        if self.controller._use_manager and self.controller._manager:
-                            if not self.controller._manager._connected_event.is_set():
-                                raise RuntimeError("Controller not connected")
-                        regs = await self.controller.modbus_read_holding_registers(unit, addr, regs_to_read)
-                        if regs is None:
-                            raise RuntimeError("Read returned None")
-                    else:
-                        # Fall back to standalone pymodbus client
-                        uri = self.build_uri()
-                        regs_data = await self._read_registers(uri, addr, count, long_mode, endian, False, unit)
-                        # Extract raw register values from ReadRow objects
-                        regs = [r.int_value & 0xFFFF for r in regs_data] if regs_data else []
+                    rows = await self._read_rows(
+                        addr,
+                        count,
+                        long_mode,
+                        endian,
+                        False,
+                        DataType.HOLDING,
+                        unit,
+                        self._connection_uri,
+                    )
+                    regs = [int(r.int_value) & 0xFFFF for r in rows] if rows else []
 
                     # Create one sample with all raw register values for this interval
                     sample = MonitorSample(
@@ -2012,8 +1942,9 @@ class MainWindow(QMainWindow):
                     except Exception:
                         pass
 
-                except Exception as exc:
-                    # Record error as a sample row
+                except RuntimeError as exc:
+                    # RuntimeError from run_gui_read contains user-friendly message
+                    logger.warning("Monitor poll error: %s", exc)
                     error_sample = MonitorSample(
                         timestamp=timestamp,
                         raw_registers=[],
@@ -2022,7 +1953,17 @@ class MainWindow(QMainWindow):
                         error=str(exc),
                     )
                     self.monitor_model.add_sample(error_sample)
-                    logger.exception("Monitor poll error")
+                except Exception as exc:
+                    # Unexpected error - log full traceback but continue monitoring
+                    logger.exception("Monitor poll unexpected error")
+                    error_sample = MonitorSample(
+                        timestamp=timestamp,
+                        raw_registers=[],
+                        address_start=addr,
+                        unit_id=unit,
+                        error=f"Unexpected error: {exc}",
+                    )
+                    self.monitor_model.add_sample(error_sample)
 
                 # Wait for next poll interval
                 await asyncio.sleep(interval_sec)

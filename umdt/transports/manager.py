@@ -47,12 +47,11 @@ class ConnectionManager:
         if uri.startswith("mock://"):
             return MockTransport()
         if uri.startswith("tcp://"):
-            rest = uri[len("tcp://"):]
-            if ":" in rest:
-                host, port = rest.split(":", 1)
-                return TcpTransport(host, int(port))
-            else:
-                return TcpTransport(rest, 502)
+            # Use urlparse to correctly handle query strings (e.g. ?unit=1)
+            parsed = urlparse(uri)
+            host = parsed.hostname or parsed.path
+            port = parsed.port or 502
+            return TcpTransport(host, int(port))
         if uri.startswith("serial://"):
             # lazy import to avoid hard dependency at module import time
             try:
@@ -84,13 +83,13 @@ class ConnectionManager:
             self._loop = None
         if self._connect_task and not self._connect_task.done():
             return
+        # Start the reconnect loop in background and return immediately.
+        # Callers who want to wait for a connection can await
+        # `manager._connected_event.wait()` themselves; awaiting here caused
+        # re-entrancy issues when used from the GUI event loop.
         self._connect_task = asyncio.create_task(self._reconnect_loop())
-        # wait for first successful connection (best-effort, small timeout)
-        try:
-            await asyncio.wait_for(self._connected_event.wait(), timeout=5.0)
-        except Exception:
-            # timeout or cancelled — caller can decide how to proceed
-            self._notify("connect timeout/wait finished")
+        # Best-effort notify that connection attempt has started
+        self._notify(f"connect initiated to {self.uri}")
 
     async def stop(self):
         self._stop = True
@@ -133,9 +132,18 @@ class ConnectionManager:
             except Exception:
                 pass
 
+            # Grab a reference to the transport under the lock, but do NOT hold
+            # the lock while awaiting the transport's receive. Holding the lock
+            # here caused a deadlock: the rx logging loop would acquire the
+            # lock and then block on receive, preventing send() from acquiring
+            # the lock to transmit requests. Fetching the transport reference
+            # and releasing the lock before awaiting avoids that interlock.
+            transport = None
             async with self.lock:
-                if self.transport:
-                    return await self.transport.receive()
+                transport = self.transport
+
+            if transport:
+                return await transport.receive()
 
             if asyncio.get_event_loop().time() > deadline:
                 raise RuntimeError("No transport connected")
@@ -181,16 +189,33 @@ class ConnectionManager:
         if not self.transport:
             raise RuntimeError("No transport connected")
 
-        async with self.lock:
-            await self.send(data)
-            return await asyncio.wait_for(self.receive(), timeout=timeout)
+        # Use the public send/receive helpers. These manage the lock
+        # appropriately; do not attempt to hold the lock across both calls
+        # because that would deadlock when another coroutine (e.g. the
+        # controller rx logger) is concurrently awaiting receive().
+        await self.send(data)
+        return await asyncio.wait_for(self.receive(), timeout=timeout)
 
     def send_and_receive_blocking(self, data: bytes, timeout: float = 2.0) -> bytes:
         """Blocking helper usable from threads: schedules an async send/receive on the manager loop.
 
         Raises Exception on errors or if the manager loop is not available.
         """
-        if not self._loop:
-            raise RuntimeError("ConnectionManager loop not initialized")
-        fut = asyncio.run_coroutine_threadsafe(self._send_and_receive(data, timeout=timeout), self._loop)
-        return fut.result(timeout + 1.0)
+        # This helper is intended to be called from OTHER threads (not the
+        # manager's event loop). Calling it from within the manager's running
+        # loop (e.g., the GUI event loop) will attempt to synchronously wait
+        # for a coroutine on the same loop and raise a RuntimeError. Detect
+        # that situation and raise a clear error instead of attempting the
+        # dangerous call.
+        try:
+            # If a running loop exists in this thread, don't proceed.
+            asyncio.get_running_loop()
+        except RuntimeError:
+            # No running loop in this thread: safe to schedule onto manager loop
+            if not self._loop:
+                raise RuntimeError("ConnectionManager loop not initialized")
+            fut = asyncio.run_coroutine_threadsafe(self._send_and_receive(data, timeout=timeout), self._loop)
+            return fut.result(timeout + 1.0)
+        else:
+            # We are running inside an event loop — this API is invalid here.
+            raise RuntimeError("send_and_receive_blocking cannot be called from the event loop thread; use the async send/receive helpers instead")

@@ -6,6 +6,14 @@ from umdt.core.controller import CoreController
 from umdt.commands.builder import CommandBuilder
 from umdt.utils.ieee754 import from_bytes_to_float32, from_bytes_to_float16
 from urllib.parse import urlparse, parse_qs
+from umdt.core.data_types import (
+    DATA_TYPE_PROPERTIES,
+    DataType,
+    is_bit_type,
+    is_register_type,
+    parse_data_type,
+)
+from umdt.utils.modbus_compat import call_read_method, call_write_method
 
 # serial port listing (optional)
 _HAS_PYSERIAL = True
@@ -22,49 +30,7 @@ def _normalize_serial_port(s: str) -> str:
     return s.lstrip("/")
 
 
-import inspect
 import time
-
-
-def _read_holding_registers_compat(client, address: int, count: int, unit: int):
-    """Call various pymodbus client.read_holding_registers signatures compatibly."""
-    fn = client.read_holding_registers
-    try:
-        sig = inspect.signature(fn)
-        params = list(sig.parameters.keys())
-    except Exception:
-        params = []
-    # Prefer keyword-based calls (address positional, count and unit as keywords)
-    try:
-        if 'count' in params and 'device_id' in params:
-            return fn(address, count=count, device_id=unit)
-        if 'count' in params and 'unit' in params:
-            return fn(address, count=count, unit=unit)
-        if 'count' in params and 'slave' in params:
-            return fn(address, count=count, slave=unit)
-        if 'count' in params and 'device' in params:
-            return fn(address, count=count, device=unit)
-        if 'count' in params and 'unit_id' in params:
-            return fn(address, count=count, unit_id=unit)
-    except TypeError:
-        # if keyword invocation fails, fall back
-        pass
-
-    # Next try calling with count as keyword only
-    try:
-        if 'count' in params:
-            return fn(address, count=count)
-    except Exception:
-        pass
-
-    # Finally attempt positional calls as last resort
-    try:
-        return fn(address, count, unit)
-    except Exception:
-        try:
-            return fn(address, count)
-        except Exception:
-            raise
 
 _HAS_PYMODBUS = True
 ModbusTcpClient = None
@@ -304,8 +270,57 @@ def _present_registers(start_addr: int, regs: List[int], e_norm: str, address_wa
     console.print(table)
 
 
+def _present_bits(start_addr: int, bits: List[bool], address_was_hex: bool, label: str):
+    table = Table(show_header=True, header_style="bold magenta")
+    table.add_column("Index")
+    table.add_column(label)
+    table.add_column("State")
+    table.add_column("Byte Offset")
+    table.add_column("Bit")
+    for i, bit in enumerate(bits):
+        idx = start_addr + i
+        idx_disp = hex(idx) if address_was_hex else str(idx)
+        state = "ON" if bit else "OFF"
+        table.add_row(
+            idx_disp,
+            "1" if bit else "0",
+            state,
+            str(i // 8),
+            str(i % 8),
+        )
+    console.print(table)
+
+
+def _extract_values(rr, bit_based: bool):
+    if rr is None:
+        return None, "No response (timeout)"
+    if hasattr(rr, 'isError') and rr.isError():
+        return None, _describe_modbus_error(rr)
+
+    attr = 'bits' if bit_based else 'registers'
+    values = getattr(rr, attr, None)
+    if values is not None:
+        return list(values), None
+
+    try:
+        return list(rr), None
+    except Exception:
+        return [rr], None
+
+
 @app.command()
-def read(serial: Optional[str] = typer.Option(None, help="Serial port (e.g. COM5) to read from"), baud: int = typer.Option(9600, help="Baud rate for serial"), host: Optional[str] = typer.Option(None, help="Modbus TCP host"), port: int = typer.Option(502, help="Modbus TCP port"), unit: int = typer.Option(1, help="Modbus unit id"), address: Optional[str] = typer.Option(None, prompt="Starting register address (decimal or 0xHEX)" , help="Starting register address (decimal or 0xHEX)"), count: int = typer.Option(1, help="Number of registers to read when using --serial/--host (default 1)"), long: bool = typer.Option(False, "--long", "-l", help="(deprecated) read two registers and show float permutations"), endian: str = typer.Option("big", "--endian", "-e", help="Endian to use: big|little|mid-big|mid-little|all (or b,l,mb,ml)") ): 
+def read(
+    serial: Optional[str] = typer.Option(None, help="Serial port (e.g. COM5) to read from"),
+    baud: int = typer.Option(9600, help="Baud rate for serial"),
+    host: Optional[str] = typer.Option(None, help="Modbus TCP host"),
+    port: int = typer.Option(502, help="Modbus TCP port"),
+    unit: int = typer.Option(1, help="Modbus unit id"),
+    address: Optional[str] = typer.Option(None, prompt="Starting address (decimal or 0xHEX)", help="Starting address (decimal or 0xHEX)"),
+    count: int = typer.Option(1, help="Number of values to read (registers, coils, or inputs)"),
+    long: bool = typer.Option(False, "--long", "-l", help="Read 32-bit values (two registers per value); register types only"),
+    endian: str = typer.Option("big", "--endian", "-e", help="Endian to use for register types: big|little|mid-big|mid-little|all"),
+    datatype: str = typer.Option("holding", "--datatype", "-d", help="Data type: holding|input|coil|discrete"),
+):
     """Decode registers locally, or read from a device via `--serial/--baud` or `--host/--port`.
 
     By default a single 16-bit register is read. Use `--long` (`-l`) to read two registers
@@ -337,6 +352,21 @@ def read(serial: Optional[str] = typer.Option(None, help="Serial port (e.g. COM5
                 port = int(typer.prompt("Modbus TCP port", default=str(port)))
             except Exception:
                 port = port
+
+    try:
+        data_type = parse_data_type(datatype)
+    except ValueError as exc:
+        console.print(str(exc))
+        raise typer.Exit(code=1)
+
+    props = DATA_TYPE_PROPERTIES[data_type]
+    if not props.readable or not props.pymodbus_read_method:
+        console.print(f"Data type '{data_type.value}' is not readable")
+        raise typer.Exit(code=1)
+
+    if long and not is_register_type(data_type):
+        console.print("--long is only valid for holding/input registers")
+        raise typer.Exit(code=1)
 
     # proceed with provided or prompted connection info
     if serial or host:
@@ -371,14 +401,19 @@ def read(serial: Optional[str] = typer.Option(None, help="Serial port (e.g. COM5
                 numeric_address = int(address)
                 address_was_hex = False
 
-            # decide how many registers to read
-            # --count is the number of values. If --long is set, each value is 2 registers.
-            # So number of registers to read is count (normal) or count*2 (long).
             num_values = max(1, int(count))
-            if long:
-                regs_to_read = num_values * 2
+            if is_register_type(data_type):
+                regs_to_read = num_values * (2 if long else 1)
+                if regs_to_read > 125:
+                    console.print(f"Requested {regs_to_read} registers exceeds Modbus limit of 125")
+                    client.close()
+                    raise typer.Exit(code=1)
             else:
                 regs_to_read = num_values
+                if regs_to_read > 2000:
+                    console.print("Requested coil/input count exceeds Modbus limit of 2000")
+                    client.close()
+                    raise typer.Exit(code=1)
 
             # normalize endian option
             e_str = (endian or "big").lower()
@@ -389,55 +424,46 @@ def read(serial: Optional[str] = typer.Option(None, help="Serial port (e.g. COM5
                 'ml': 'mid-little', 'mid-little': 'mid-little',
                 'all': 'all'
             }
-            e_norm = _endian_map.get(e_str)
-            if e_norm is None:
-                console.print(f"Unknown endian '{endian}'")
-                client.close()
-                raise typer.Exit(code=1)
-
-            # disallow confusing combinations: 'all' with count>1
-            if e_norm == 'all' and num_values > 1:
+            e_norm = _endian_map.get(e_str, 'big')
+            if not is_register_type(data_type):
+                if e_norm != 'big' and endian:
+                    console.print("Ignoring --endian for coil/discrete types")
+                e_norm = 'big'
+            elif e_norm == 'all' and num_values > 1:
                 console.print("--endian all cannot be used with --count greater than 1")
                 client.close()
                 raise typer.Exit(code=1)
 
-            # enforce Modbus max registers per request
-            MAX_REGISTERS = 125
-            if regs_to_read > MAX_REGISTERS:
-                console.print(f"Requested {regs_to_read} registers exceeds Modbus limit of {MAX_REGISTERS}")
+            try:
+                rr = call_read_method(client, props.pymodbus_read_method, numeric_address, regs_to_read, unit)
+            except AttributeError as exc:
+                console.print(str(exc))
                 client.close()
                 raise typer.Exit(code=1)
 
-            rr = _read_holding_registers_compat(client, numeric_address, regs_to_read, unit)
-            if hasattr(rr, 'isError') and rr.isError():
-                desc = _describe_modbus_error(rr)
-                console.print(f"[red]Read error: {desc}[/red]")
+            values, err = _extract_values(rr, is_bit_type(data_type))
+            if err:
+                console.print(f"[red]Read error: {err}[/red]")
             else:
-                regs = getattr(rr, 'registers', None)
-                if regs is None:
-                    try:
-                        regs = list(rr)
-                    except Exception:
-                        regs = [rr]
-
-                if long:
-                    # regs contains num_values * 2 registers; present a block per long value
-                    perms_list = []
-                    for vi in range(num_values):
-                        base_idx = vi * 2
-                        if base_idx + 1 >= len(regs):
-                            console.print(f"Not enough registers for long value {vi}")
-                            break
-                        a = int(regs[base_idx])
-                        b = int(regs[base_idx + 1])
-                        perms = _format_permutations([a, b])
-                        perms_list.append(perms)
-
-                    # present as a single table with one row per value
-                    _present_long_table(numeric_address, perms_list, e_norm, address_was_hex)
+                if is_register_type(data_type):
+                    regs = [int(v) & 0xFFFF for v in values]
+                    if long:
+                        perms_list = []
+                        for vi in range(num_values):
+                            base_idx = vi * 2
+                            if base_idx + 1 >= len(regs):
+                                console.print(f"Not enough registers for long value {vi}")
+                                break
+                            a = regs[base_idx]
+                            b = regs[base_idx + 1]
+                            perms = _format_permutations([a, b])
+                            perms_list.append(perms)
+                        _present_long_table(numeric_address, perms_list, e_norm, address_was_hex)
+                    else:
+                        _present_registers(numeric_address, regs, e_norm, address_was_hex)
                 else:
-                    # present each register as individual values (treat count=1 the same)
-                    _present_registers(numeric_address, regs, e_norm, address_was_hex)
+                    bit_label = "Coil" if data_type == DataType.COIL else "Input"
+                    _present_bits(numeric_address, [bool(v) for v in values], address_was_hex, bit_label)
         finally:
             client.close()
         return
@@ -477,7 +503,19 @@ def decode(values: List[str] = typer.Argument(..., help="One or two register val
 
 
 @app.command()
-def monitor(serial: Optional[str] = typer.Option(None, help="Serial port (e.g. COM5) to monitor"), baud: int = typer.Option(9600, help="Baud rate for serial"), host: Optional[str] = typer.Option(None, help="Modbus TCP host"), port: int = typer.Option(502, help="Modbus TCP port"), unit: int = typer.Option(1, help="Modbus unit id"), address: Optional[str] = typer.Option(None, prompt="Starting register address (decimal or 0xHEX)", help="Starting register address (decimal or 0xHEX)"), count: int = typer.Option(1, help="Number of registers/values to read each poll (default 1)"), long: bool = typer.Option(False, "--long", "-l", help="Read long values (each value = 2 registers)"), endian: str = typer.Option("big", "--endian", "-e", help="Endian to use: big|little|mid-big|mid-little|all (or b,l,mb,ml)"), interval: float = typer.Option(1.0, help="Poll interval seconds")):
+def monitor(
+    serial: Optional[str] = typer.Option(None, help="Serial port (e.g. COM5) to monitor"),
+    baud: int = typer.Option(9600, help="Baud rate for serial"),
+    host: Optional[str] = typer.Option(None, help="Modbus TCP host"),
+    port: int = typer.Option(502, help="Modbus TCP port"),
+    unit: int = typer.Option(1, help="Modbus unit id"),
+    address: Optional[str] = typer.Option(None, prompt="Starting address (decimal or 0xHEX)", help="Starting address (decimal or 0xHEX)"),
+    count: int = typer.Option(1, help="Number of values per poll"),
+    long: bool = typer.Option(False, "--long", "-l", help="Read 32-bit values (two registers per value); register types only"),
+    endian: str = typer.Option("big", "--endian", "-e", help="Endian for register types: big|little|mid-big|mid-little|all"),
+    datatype: str = typer.Option("holding", "--datatype", "-d", help="Data type: holding|input|coil|discrete"),
+    interval: float = typer.Option(1.0, help="Poll interval seconds"),
+):
     """Continuously poll registers and display values using the same formatting as `read`.
 
     Behaves like `read` but polls repeatedly. Use `--serial`/`--baud` or `--host`/`--port`,
@@ -510,6 +548,21 @@ def monitor(serial: Optional[str] = typer.Option(None, help="Serial port (e.g. C
             except Exception:
                 port = port
 
+    try:
+        data_type = parse_data_type(datatype)
+    except ValueError as exc:
+        console.print(str(exc))
+        raise typer.Exit(code=1)
+
+    props = DATA_TYPE_PROPERTIES[data_type]
+    if not props.readable or not props.pymodbus_read_method:
+        console.print(f"Data type '{data_type.value}' is not readable")
+        raise typer.Exit(code=1)
+
+    if long and not is_register_type(data_type):
+        console.print("--long is only valid for holding/input registers")
+        raise typer.Exit(code=1)
+
     client = None
     if serial:
         sp = _normalize_serial_port(serial)
@@ -535,7 +588,19 @@ def monitor(serial: Optional[str] = typer.Option(None, help="Serial port (e.g. C
             raise typer.Exit(code=1)
 
         num_values = max(1, int(count))
-        # normalize endian option for monitor
+        if is_register_type(data_type):
+            regs_to_read = num_values * (2 if long else 1)
+            if regs_to_read > 125:
+                console.print(f"Requested {regs_to_read} registers exceeds Modbus limit of 125")
+                client.close()
+                raise typer.Exit(code=1)
+        else:
+            regs_to_read = num_values
+            if regs_to_read > 2000:
+                console.print("Requested coil/input count exceeds Modbus limit of 2000")
+                client.close()
+                raise typer.Exit(code=1)
+
         e_str = (endian or "big").lower()
         _endian_map = {
             'b': 'big', 'big': 'big',
@@ -544,56 +609,43 @@ def monitor(serial: Optional[str] = typer.Option(None, help="Serial port (e.g. C
             'ml': 'mid-little', 'mid-little': 'mid-little',
             'all': 'all'
         }
-        e_norm = _endian_map.get(e_str)
-        if e_norm is None:
-            console.print(f"Unknown endian '{endian}'")
-            client.close()
-            raise typer.Exit(code=1)
-        # enforce Modbus max registers per request before polling loop
-        MAX_REGISTERS = 125
-        if (num_values * 2 if long else num_values) > MAX_REGISTERS:
-            console.print(f"Requested {(num_values * 2 if long else num_values)} registers exceeds Modbus limit of {MAX_REGISTERS}")
-            client.close()
-            raise typer.Exit(code=1)
-
-        # disallow 'all' with count>1
-        if e_norm == 'all' and num_values > 1:
+        e_norm = _endian_map.get(e_str, 'big')
+        if not is_register_type(data_type):
+            if e_norm != 'big' and endian:
+                console.print("Ignoring --endian for coil/discrete types")
+            e_norm = 'big'
+        elif e_norm == 'all' and num_values > 1:
             console.print("--endian all cannot be used with --count greater than 1")
             client.close()
             raise typer.Exit(code=1)
 
         while True:
-            # determine how many registers to read this poll
-            regs_to_read = num_values * 2 if long else num_values
-            rr = _read_holding_registers_compat(client, numeric_address, regs_to_read, unit)
-            if hasattr(rr, 'isError') and rr.isError():
-                desc = _describe_modbus_error(rr)
-                console.print(f"[red]Read error: {desc}[/red]")
+            try:
+                rr = call_read_method(client, props.pymodbus_read_method, numeric_address, regs_to_read, unit)
+            except AttributeError as exc:
+                console.print(str(exc))
+                break
+
+            values, err = _extract_values(rr, is_bit_type(data_type))
+            if err:
+                console.print(f"[red]Read error: {err}[/red]")
             else:
-                regs = getattr(rr, 'registers', None)
-                if regs is None:
-                    try:
-                        regs = list(rr)
-                    except Exception:
-                        regs = [rr]
-
-                # reuse the same presentation logic as `read`
-                if long:
-                    perms_list = []
-                    for vi in range(num_values):
-                        base_idx = vi * 2
-                        if base_idx + 1 >= len(regs):
-                            console.print(f"Not enough registers for long value {vi}")
-                            break
-                        a = int(regs[base_idx])
-                        b = int(regs[base_idx + 1])
-                        perms = _format_permutations([a, b])
-                        perms_list.append(perms)
-
-                    # present as a single table with one row per value
-                    _present_long_table(numeric_address, perms_list, e_norm, address_was_hex)
+                if is_register_type(data_type):
+                    regs = [int(v) & 0xFFFF for v in values]
+                    if long:
+                        perms_list = []
+                        for vi in range(num_values):
+                            base_idx = vi * 2
+                            if base_idx + 1 >= len(regs):
+                                console.print(f"Not enough registers for long value {vi}")
+                                break
+                            perms_list.append(_format_permutations([regs[base_idx], regs[base_idx + 1]]))
+                        _present_long_table(numeric_address, perms_list, e_norm, address_was_hex)
+                    else:
+                        _present_registers(numeric_address, regs, e_norm, address_was_hex)
                 else:
-                    _present_registers(numeric_address, regs, e_norm, address_was_hex)
+                    bit_label = "Coil" if data_type == DataType.COIL else "Input"
+                    _present_bits(numeric_address, [bool(v) for v in values], address_was_hex, bit_label)
 
             time.sleep(interval)
     except KeyboardInterrupt:
@@ -628,34 +680,47 @@ def write(
     host: Optional[str] = typer.Option(None, help="Modbus TCP host"),
     port: int = typer.Option(502, help="Modbus TCP port"),
     unit: int = typer.Option(1, help="Modbus unit id"),
-    address: Optional[str] = typer.Option(None, prompt="Starting register address (decimal or 0xHEX)", help="Starting register address (decimal or 0xHEX)"),
-    long: bool = typer.Option(False, "--long", "-l", help="Write a 32-bit (two-register) value; omit for 16-bit"),
-    endian: str = typer.Option("big", "--endian", "-e", help="Endian to use for 32-bit writes: big|little|mid-big|mid-little (b,l,mb,ml)"),
+    address: Optional[str] = typer.Option(None, prompt="Starting address (decimal or 0xHEX)", help="Starting address (decimal or 0xHEX)"),
+    long: bool = typer.Option(False, "--long", "-l", help="Write a 32-bit (two-register) value; register types only"),
+    endian: str = typer.Option("big", "--endian", "-e", help="Endian for register types: big|little|mid-big|mid-little"),
     float_mode: bool = typer.Option(False, "--float", help="Interpret the value as a float (16-bit by default, 32-bit with --long)"),
     signed: bool = typer.Option(False, "--signed", help="Interpret integer value as signed and validate against signed range"),
-    value: Optional[str] = typer.Argument(None, help="Value to write: integer or 0xHEX; float allowed only with --float")
+    datatype: str = typer.Option("holding", "--datatype", "-d", help="Data type: holding|coil"),
+    value: Optional[str] = typer.Argument(None, help="Value to write; registers accept int/float, coils accept comma-separated booleans"),
 ):
-    """Write a single 16-bit register or a 32-bit (two-register) value.
+    """Write register or coil values using the selected transport."""
 
-    - Connection options mirror `read`: `--serial`/`--baud` or `--host`/`--port`.
-    - `address` accepts decimal or 0xHEX.
-        - `--long` selects a 32-bit write (two registers); otherwise 16-bit.
-        - `value` is an integer or 0xHEX. Use `--float` to write a float value:
-            16-bit Float16 by default, or 32-bit Float32 when `--long` is also set.
-    - `--signed` switches validation to signed ranges; it is also implied
-      automatically if the supplied integer value is negative.
-    """
     if not _HAS_PYMODBUS:
         console.print("pymodbus is required for write")
         raise typer.Exit(code=1)
 
-    # Validate mutually exclusive connection flags
+    try:
+        data_type = parse_data_type(datatype)
+    except ValueError as exc:
+        console.print(str(exc))
+        raise typer.Exit(code=1)
+
+    props = DATA_TYPE_PROPERTIES.get(data_type)
+    if not props or not props.writable or not props.pymodbus_write_method:
+        console.print(f"Data type '{data_type.value}' is not writable")
+        raise typer.Exit(code=1)
+
+    if not is_register_type(data_type):
+        if long:
+            console.print("--long is only valid for holding registers")
+            raise typer.Exit(code=1)
+        if float_mode:
+            console.print("--float is not supported for coil writes")
+            raise typer.Exit(code=1)
+        if signed:
+            console.print("--signed is not applicable for coil writes")
+            raise typer.Exit(code=1)
+
     conn_methods = sum(bool(x) for x in (serial, host))
     if conn_methods > 1:
         console.print("Specify only one of --serial or --host")
         raise typer.Exit(code=1)
 
-    # Wizard-style prompting for connection if not supplied
     if not (serial or host):
         method = typer.prompt("Connect via 'serial' or 'tcp'?", default="serial")
         method = (method or "").strip().lower()
@@ -672,9 +737,8 @@ def write(
             except Exception:
                 port = port
 
-    # Parse and normalize address
     if address is None:
-        address = typer.prompt("Starting register address (decimal or 0xHEX)")
+        address = typer.prompt("Starting address (decimal or 0xHEX)")
     address_was_hex = False
     a_str = address.strip() if isinstance(address, str) else str(address)
     if a_str.lower().startswith("0x"):
@@ -685,7 +749,6 @@ def write(
         console.print("Invalid address format")
         raise typer.Exit(code=1)
 
-    # Endian handling (for 32-bit writes only)
     e_str = (endian or "big").lower()
     endian_map = {
         "b": "big", "big": "big",
@@ -693,14 +756,19 @@ def write(
         "mb": "mid-big", "mid-big": "mid-big",
         "ml": "mid-little", "mid-little": "mid-little",
     }
-    e_norm = endian_map.get(e_str)
-    if e_norm is None:
+    e_norm = endian_map.get(e_str, "big")
+    if not is_register_type(data_type):
+        if endian and e_norm != "big":
+            console.print("Ignoring --endian for coil writes")
+        e_norm = "big"
+    elif e_norm is None:
         console.print(f"Unknown endian '{endian}'")
         raise typer.Exit(code=1)
 
-    # Prompt for value if not provided
     if value is None:
-        if float_mode:
+        if not is_register_type(data_type):
+            value = typer.prompt("Value(s) to write (comma separated 0/1/true/false)")
+        elif float_mode:
             value = typer.prompt("Value to write (float)")
         else:
             value = typer.prompt("Value to write (integer or 0xHEX)")
@@ -708,167 +776,164 @@ def write(
             console.print("No value provided")
             raise typer.Exit(code=1)
 
-    # Parse and validate value according to flags
-    is_hex = isinstance(value, str) and value.strip().lower().startswith("0x")
-
-    if float_mode:
-        if is_hex:
-            console.print("Hex values are not allowed when using --float")
+    payload_values: List = []
+    if not is_register_type(data_type):
+        tokens = [part for part in str(value).replace(',', ' ').split() if part]
+        if not tokens:
+            console.print("Provide at least one coil value (0/1/true/false)")
             raise typer.Exit(code=1)
-        try:
-            float_val = float(value)
-        except Exception:
-            console.print("Value must be a float (or integer) when using --float")
-            raise typer.Exit(code=1)
+        for token in tokens:
+            tl = token.strip().lower()
+            if tl in ("1", "true", "on", "set"):
+                payload_values.append(True)
+            elif tl in ("0", "false", "off", "clear"):
+                payload_values.append(False)
+            else:
+                console.print(f"Unknown coil value '{token}' (use 0/1/true/false)")
+                raise typer.Exit(code=1)
     else:
-        # Integer / hex path
-        try:
-            int_val = int(value, 0)
-        except Exception:
-            console.print("Value must be an integer or 0xHEX when not using --float")
-            raise typer.Exit(code=1)
-
-        # signed is implied for negative integers
-        if int_val < 0:
-            signed = True
-
-        # Validate ranges based on width and signedness
-        if long:
-            # 32-bit
-            if signed:
-                if int_val < -0x80000000 or int_val > 0x7FFFFFFF:
-                    console.print("Value out of 32-bit signed range (-2^31..2^31-1)")
-                    raise typer.Exit(code=1)
-            else:
-                if int_val < 0 or int_val > 0xFFFFFFFF:
-                    console.print("Value out of 32-bit unsigned range (0..2^32-1)")
-                    raise typer.Exit(code=1)
+        is_hex = isinstance(value, str) and value.strip().lower().startswith("0x")
+        if float_mode:
+            if is_hex:
+                console.print("Hex values are not allowed when using --float")
+                raise typer.Exit(code=1)
+            try:
+                float_val = float(value)
+            except Exception:
+                console.print("Value must be a float (or integer) when using --float")
+                raise typer.Exit(code=1)
         else:
-            # 16-bit
-            if signed:
-                if int_val < -0x8000 or int_val > 0x7FFF:
-                    console.print("Value out of 16-bit signed range (-2^15..2^15-1)")
-                    raise typer.Exit(code=1)
-            else:
-                if int_val < 0 or int_val > 0xFFFF:
-                    console.print("Value out of 16-bit unsigned range (0..2^16-1)")
-                    raise typer.Exit(code=1)
+            try:
+                int_val = int(value, 0)
+            except Exception:
+                console.print("Value must be an integer or 0xHEX when not using --float")
+                raise typer.Exit(code=1)
 
-    # Build register payload
-    if float_mode:
-        import struct
+            if int_val < 0:
+                signed = True
 
-        if long:
-            # 32-bit IEEE-754 float (two registers)
-            raw_be = struct.pack("!f", float_val)  # network (big-endian) order
-            if e_norm == "big":
-                bv = raw_be
-            elif e_norm == "little":
-                bv = raw_be[::-1]
-            elif e_norm == "mid-big":
-                bv = bytes([raw_be[2], raw_be[3], raw_be[0], raw_be[1]])
-            else:  # mid-little
-                bv = bytes([raw_be[1], raw_be[0], raw_be[3], raw_be[2]])
-
-            regs = [int.from_bytes(bv[0:2], byteorder="big"), int.from_bytes(bv[2:4], byteorder="big")]
-        else:
-            # 16-bit float (single register). We always store the register
-            # value in big-endian word order; the wire byte order is controlled
-            # by the device, but for consistency with read we allow Big/Little
-            # byte order via the same `endian` flag by swapping the bytes.
-            # Here we encode to Float16 (half) then apply byte swapping if
-            # `endian` is 'little'. Mid-* variants are not meaningful for 16-bit.
-            import math
-
-            f = float_val
-            if math.isnan(f):
-                half = 0x7E00
-            elif math.isinf(f):
-                half = 0x7C00 if f > 0 else 0xFC00
-            else:
-                sign = 0
-                if f < 0:
-                    sign = 0x8000
-                    f = -f
-                if f == 0.0:
-                    half = sign
+            if long:
+                if signed:
+                    if int_val < -0x80000000 or int_val > 0x7FFFFFFF:
+                        console.print("Value out of 32-bit signed range (-2^31..2^31-1)")
+                        raise typer.Exit(code=1)
                 else:
-                    exp = int(math.floor(math.log(f, 2)))
-                    frac = f / (2 ** exp) - 1.0
-                    exp16 = exp + 15
-                    if exp16 <= 0:
-                        mant16 = int(round(f / (2 ** -24)))
-                        half = sign | mant16
-                    elif exp16 >= 0x1F:
-                        half = sign | 0x7C00
+                    if int_val < 0 or int_val > 0xFFFFFFFF:
+                        console.print("Value out of 32-bit unsigned range (0..2^32-1)")
+                        raise typer.Exit(code=1)
+            else:
+                if signed:
+                    if int_val < -0x8000 or int_val > 0x7FFF:
+                        console.print("Value out of 16-bit signed range (-2^15..2^15-1)")
+                        raise typer.Exit(code=1)
+                else:
+                    if int_val < 0 or int_val > 0xFFFF:
+                        console.print("Value out of 16-bit unsigned range (0..2^16-1)")
+                        raise typer.Exit(code=1)
+
+        if float_mode:
+            import struct
+
+            if long:
+                raw_be = struct.pack("!f", float_val)
+                if e_norm == "big":
+                    bv = raw_be
+                elif e_norm == "little":
+                    bv = raw_be[::-1]
+                elif e_norm == "mid-big":
+                    bv = bytes([raw_be[2], raw_be[3], raw_be[0], raw_be[1]])
+                else:
+                    bv = bytes([raw_be[1], raw_be[0], raw_be[3], raw_be[2]])
+                payload_values = [
+                    int.from_bytes(bv[0:2], byteorder="big"),
+                    int.from_bytes(bv[2:4], byteorder="big"),
+                ]
+            else:
+                import math
+
+                f = float_val
+                if math.isnan(f):
+                    half = 0x7E00
+                elif math.isinf(f):
+                    half = 0x7C00 if f > 0 else 0xFC00
+                else:
+                    sign = 0
+                    if f < 0:
+                        sign = 0x8000
+                        f = -f
+                    if f == 0.0:
+                        half = sign
                     else:
-                        mant16 = int(round(frac * (1 << 10)))
-                        if mant16 == (1 << 10):
-                            exp16 += 1
-                            mant16 = 0
-                            if exp16 >= 0x1F:
-                                half = sign | 0x7C00
+                        exp = int(math.floor(math.log(f, 2)))
+                        frac = f / (2 ** exp) - 1.0
+                        exp16 = exp + 15
+                        if exp16 <= 0:
+                            mant16 = int(round(f / (2 ** -24)))
+                            half = sign | mant16
+                        elif exp16 >= 0x1F:
+                            half = sign | 0x7C00
+                        else:
+                            mant16 = int(round(frac * (1 << 10)))
+                            if mant16 == (1 << 10):
+                                exp16 += 1
+                                mant16 = 0
+                                if exp16 >= 0x1F:
+                                    half = sign | 0x7C00
+                                else:
+                                    half = sign | (exp16 << 10) | (mant16 & 0x3FF)
                             else:
                                 half = sign | (exp16 << 10) | (mant16 & 0x3FF)
-                        else:
-                            half = sign | (exp16 << 10) | (mant16 & 0x3FF)
 
-            # Apply byte order for 16-bit: big vs little
-            b = half.to_bytes(2, byteorder="big")
-            if e_norm in ("little",):
-                b = b[::-1]
-            regs = [int.from_bytes(b, byteorder="big")]
-    else:
-        if long:
-            width_bits = 32
+                b = half.to_bytes(2, byteorder="big")
+                if e_norm in ("little",):
+                    b = b[::-1]
+                payload_values = [int.from_bytes(b, byteorder="big")]
         else:
-            width_bits = 16
-
-        if signed:
-            # convert signed integer to two's complement unsigned of given width
+            width_bits = 32 if long else 16
             max_val = 1 << width_bits
-            int_u = int_val & (max_val - 1)
-        else:
-            int_u = int_val
+            int_u = int_val & (max_val - 1) if signed else int_val
+            byte_len = width_bits // 8
+            bv = int_u.to_bytes(byte_len, byteorder="big", signed=False)
 
-        byte_len = width_bits // 8
-        bv = int_u.to_bytes(byte_len, byteorder="big", signed=False)
+            if long:
+                if e_norm == "little":
+                    bv = bv[::-1]
+                elif e_norm == "mid-big":
+                    bv = bytes([bv[2], bv[3], bv[0], bv[1]])
+                elif e_norm == "mid-little":
+                    bv = bytes([bv[1], bv[0], bv[3], bv[2]])
+                payload_values = [
+                    int.from_bytes(bv[0:2], byteorder="big"),
+                    int.from_bytes(bv[2:4], byteorder="big"),
+                ]
+            else:
+                if e_norm in ("little",):
+                    bv = bv[::-1]
+                payload_values = [int.from_bytes(bv, byteorder="big")]
 
-        if long:
-            # apply word/byte permutations for 32-bit
-            if e_norm == "big":
-                pass
-            elif e_norm == "little":
-                bv = bv[::-1]
-            elif e_norm == "mid-big":
-                bv = bytes([bv[2], bv[3], bv[0], bv[1]])
-            else:  # mid-little
-                bv = bytes([bv[1], bv[0], bv[3], bv[2]])
-
-            regs = [int.from_bytes(bv[0:2], byteorder="big"), int.from_bytes(bv[2:4], byteorder="big")]
-        else:
-            # 16-bit integer: apply big vs little byte order
-            if e_norm in ("little",):
-                bv = bv[::-1]
-            regs = [int.from_bytes(bv, byteorder="big")]
-
-    # Show the register encoding to the user (hex per register)
     try:
         table = Table(show_header=True, header_style="bold magenta")
-        table.add_column("Index")
-        table.add_column("Hex")
-        table.add_column("Value")
-        for i, r in enumerate(regs):
-            idx = numeric_address + i
-            idx_disp = hex(idx) if address_was_hex else str(idx)
-            hexv = '0x' + int(r).to_bytes(2, byteorder='big').hex().upper() if isinstance(r, int) else str(r)
-            table.add_row(idx_disp, hexv, str(int(r)))
+        if is_register_type(data_type):
+            table.add_column("Index")
+            table.add_column("Hex")
+            table.add_column("Value")
+            for i, r in enumerate(payload_values):
+                idx = numeric_address + i
+                idx_disp = hex(idx) if address_was_hex else str(idx)
+                hexv = '0x' + int(r).to_bytes(2, byteorder='big').hex().upper()
+                table.add_row(idx_disp, hexv, str(int(r)))
+        else:
+            table.add_column("Index")
+            table.add_column("Value")
+            table.add_column("State")
+            for i, bit in enumerate(payload_values):
+                idx = numeric_address + i
+                idx_disp = hex(idx) if address_was_hex else str(idx)
+                table.add_row(idx_disp, "1" if bit else "0", "ON" if bit else "OFF")
         console.print(table)
     except Exception:
-        # best-effort; do not fail write if display fails
         pass
 
-    # Create Modbus client and perform write
     if serial:
         sp = _normalize_serial_port(serial)
         client = ModbusSerialClient(port=sp, baudrate=baud)
@@ -880,25 +945,11 @@ def write(
         raise typer.Exit(code=1)
 
     try:
-        if long or (float_mode and len(regs) == 2):
-            # FC16: write multiple registers (32-bit value)
-            try:
-                res = client.write_registers(numeric_address, regs, unit=unit)
-            except TypeError:
-                # older pymodbus may use 'slave' instead of 'unit'
-                try:
-                    res = client.write_registers(numeric_address, regs, slave=unit)
-                except TypeError:
-                    res = client.write_registers(numeric_address, regs)
-        else:
-            # 16-bit single-register write (FC06)
-            try:
-                res = client.write_register(numeric_address, regs[0], unit=unit)
-            except TypeError:
-                try:
-                    res = client.write_register(numeric_address, regs[0], slave=unit)
-                except TypeError:
-                    res = client.write_register(numeric_address, regs[0])
+        try:
+            res = call_write_method(client, props.pymodbus_write_method, numeric_address, payload_values, unit)
+        except AttributeError as exc:
+            console.print(str(exc))
+            raise typer.Exit(code=1)
 
         if hasattr(res, "isError") and res.isError():
             console.print("[red]Write failed[/red]")
