@@ -219,6 +219,11 @@ def _present_long_table(start_addr: int, perms_list: List[dict], e_norm: str, ad
     Rows are one-per-value using the selected endian (or the single mapped key).
     """
     key_map = {'big': 'Big', 'little': 'Little', 'mid-big': 'Mid-Big', 'mid-little': 'Mid-Little'}
+    # If the caller requested 'all' but only a single long value was read,
+    # present all four permutations (reuse _present_long_block behavior).
+    if e_norm == 'all' and len(perms_list) == 1:
+        _present_long_block(start_addr, perms_list[0], e_norm, address_was_hex)
+        return
     # For multi-value reads we do not support 'all' (validated earlier); pick single key
     if e_norm == 'all':
         display_key = 'Big'
