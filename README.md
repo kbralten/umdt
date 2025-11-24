@@ -13,7 +13,7 @@ This README documents the current CLI surface and runtime behavior implemented i
 - Install runtime dependencies in your development environment:
 
 ```bash
-C:/Users/kevin/Dev/umdt/.conda/python.exe -m pip install -r requirements.txt
+pip install -r requirements.txt
 ```
 
 ## CLI Commands (current)
@@ -108,4 +108,4 @@ Configs are YAML/JSON files (see `server.md`) that describe register groups, per
 
 ## Development
 - Entry points: `main_cli.py` (diagnostics CLI), `main_gui.py` (diagnostics GUI), `mock_server_cli.py` (mock server CLI), and `mock_server_gui.py` (mock server GUI).
-- Tests: `pytest` is configured; run locally as shown above.
+- Tests: `pytest` is configured.
