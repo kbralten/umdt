@@ -2,6 +2,10 @@ import asyncio
 import math
 import random
 from typing import Optional
+from urllib.parse import urlparse
+import logging
+
+logger = logging.getLogger("umdt.transports.manager")
 
 from .base import TransportInterface
 from .mock import MockTransport
@@ -20,6 +24,7 @@ class ConnectionManager:
         self.lock = asyncio.Lock()
         self._connected_event: asyncio.Event = asyncio.Event()
         self.status_callbacks = []
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
 
     @classmethod
     def instance(cls):
@@ -50,17 +55,33 @@ class ConnectionManager:
                 return TcpTransport(rest, 502)
         if uri.startswith("serial://"):
             # lazy import to avoid hard dependency at module import time
-            from .serial_async import SerialTransport
-            rest = uri[len("serial://"):]
-            parts = rest.split(":")
-            port = parts[0]
-            baud = int(parts[1]) if len(parts) > 1 else 19200
+            try:
+                from .serial_async import SerialTransport
+            except Exception as e:
+                # Provide a clearer runtime error when serial_asyncio is not available
+                raise RuntimeError(
+                    "Serial transport requires 'pyserial-asyncio'. Install with: pip install pyserial-asyncio"
+                ) from e
+
+            # Use urlparse so query strings (e.g. ?unit=1) don't contaminate the baud
+            parsed = urlparse(uri)
+            netloc = parsed.netloc or parsed.path.lstrip('/')
+            parts = netloc.split(":") if netloc else []
+            port = parts[0] if parts else ""
+            baud = int(parts[1]) if len(parts) > 1 and parts[1] else 19200
+            logger.debug("create_transport_from_uri: serial port=%s baud=%s", port, baud)
             return SerialTransport(port, baud)
         raise ValueError("Unsupported URI scheme")
 
     async def start(self, uri: str):
         self.uri = uri
         self._stop = False
+        # remember the loop we're running on so synchronous callers can
+        # schedule coroutines back onto it via run_coroutine_threadsafe
+        try:
+            self._loop = asyncio.get_running_loop()
+        except Exception:
+            self._loop = None
         if self._connect_task and not self._connect_task.done():
             return
         self._connect_task = asyncio.create_task(self._reconnect_loop())
@@ -153,3 +174,23 @@ class ConnectionManager:
             attempt += 1
             backoff = min(60, (2 ** attempt) + random.uniform(0, 1) * attempt)
             await asyncio.sleep(backoff)
+
+    async def _send_and_receive(self, data: bytes, timeout: float = 2.0) -> bytes:
+        """Async helper: send data and wait for a receive, using the manager's lock."""
+        # Ensure transport is connected
+        if not self.transport:
+            raise RuntimeError("No transport connected")
+
+        async with self.lock:
+            await self.send(data)
+            return await asyncio.wait_for(self.receive(), timeout=timeout)
+
+    def send_and_receive_blocking(self, data: bytes, timeout: float = 2.0) -> bytes:
+        """Blocking helper usable from threads: schedules an async send/receive on the manager loop.
+
+        Raises Exception on errors or if the manager loop is not available.
+        """
+        if not self._loop:
+            raise RuntimeError("ConnectionManager loop not initialized")
+        fut = asyncio.run_coroutine_threadsafe(self._send_and_receive(data, timeout=timeout), self._loop)
+        return fut.result(timeout + 1.0)

@@ -75,6 +75,22 @@ Write a 32-bit float (Float32) to address 0 (two registers):
 python main_cli.py write --serial COM5 --baud 115200 --address 0 --long --float -12.5
 ```
 
+## GUI (interactive)
+A PySide6/qasync-based GUI is included as an interactive alternative to the CLI. It mirrors the main CLI functionality for `read`, `monitor`, and `write` while providing richer per-value decoding and a live view of activity.
+
+- Launch: `python main_gui.py` (requires `PySide6`, `qasync` and the same runtime deps in `requirements.txt`).
+- Top connection panel: choose Serial/TCP, set port/host, baud, and Unit ID; `Connect` toggles controller state.
+- Tabs:
+    - **Interact** — single-shot `Read` and `Write` panels with input validation, an immediate results table, and a details panel that shows per-endian decoding (Hex, UInt/Int, Float16/Float32). `--long` (32-bit) reads show 32-bit permutations; single-register reads show Big/Little 16-bit interpretations.
+    - **Monitor** — continuous polling with a scrolling history table and selectable rows. Selected rows populate the same decoding details panel. Monitor supports configurable poll interval and error/highlight rows for failed polls.
+- Details panel: when a table row is selected the details widget shows multiple endian permutations and numeric interpretations (mirrors `--endian all` behavior for single-value reads). For 32-bit longs the GUI shows the four common permutations (Big/Little/Mid-Big/Mid-Little).
+- Locking and transport: the GUI integrates with `CoreController` where available to reuse shared transport and locking semantics; when a controller isn't started the GUI falls back to thread-wrapped blocking reads/writes (same `pymodbus` compatibility layer used by the CLI).
+- Log view & status: lightweight log area shows recent operations (reads/writes/status) and a color-coded status label indicates connection state.
+
+Known limitations / notes:
+- `--endian all` is supported for single-value reads (shows Big/Little for 16-bit, and all four permutations for a single 32-bit long). For multi-value reads the CLI/GUI prefer a single selected endian to keep table layouts predictable.
+- The GUI currently reuses many CLI helpers; future refactors may extract decoding into a shared module.
+
 ## Development
 - Entry points: `main_cli.py` (CLI) and `main_gui.py` (GUI).
 - Tests: `pytest` is configured; run locally as shown above.

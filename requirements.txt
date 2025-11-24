@@ -4,4 +4,4 @@ qasync
 pymodbus
 rich
 pyserial
- 
+pyserial-asyncio 

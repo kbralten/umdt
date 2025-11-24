@@ -1,9 +1,14 @@
 import asyncio
 import time
-from typing import List, Callable, Dict, Optional
+import struct
+from typing import List, Callable, Dict, Optional, Tuple
 from umdt.transports.base import TransportInterface
 from umdt.transports.manager import ConnectionManager
 from umdt.database.logging import DBLogger
+import logging
+logger = logging.getLogger("umdt.controller")
+
+logger = logging.getLogger("umdt.controller")
 
 
 class CoreController:
@@ -183,6 +188,7 @@ class CoreController:
 
     async def send_data(self, data: bytes):
         self._log("TX", data)
+        logger.debug("send_data: sending %d bytes: %s", len(data), data.hex().upper())
         if self._use_manager and self._manager:
             await self._manager.send(data)
         else:
@@ -200,3 +206,179 @@ class CoreController:
                 break
             except Exception:
                 await asyncio.sleep(0.1)
+
+    # --- Modbus protocol helpers ---
+
+    def _build_modbus_request(self, unit: int, function: int, data: bytes) -> bytes:
+        """Build a simple Modbus RTU/TCP request frame.
+
+        For RTU: unit + function + data + CRC
+        For TCP: MBAP header + unit + function + data
+        We'll use a simplified TCP-style frame for now (no CRC, assume transport handles framing).
+        """
+        # Simple Modbus TCP ADU: transaction_id(2) + protocol_id(2) + length(2) + unit(1) + function(1) + data
+        # For simplicity we omit MBAP and assume raw RTU-style frames work over our transports
+        frame = bytes([unit, function]) + data
+        # Append CRC16 for RTU compatibility
+        crc = self._modbus_crc16(frame)
+        return frame + struct.pack('<H', crc)
+
+    def _modbus_crc16(self, data: bytes) -> int:
+        """Compute Modbus CRC16."""
+        crc = 0xFFFF
+        for byte in data:
+            crc ^= byte
+            for _ in range(8):
+                if crc & 0x0001:
+                    crc = (crc >> 1) ^ 0xA001
+                else:
+                    crc >>= 1
+        return crc
+
+    def _parse_modbus_response(self, frame: bytes, expected_unit: int, expected_function: int) -> Tuple[bool, Optional[bytes]]:
+        """Parse a Modbus RTU response frame.
+
+        Returns (success, data) where data is the payload (registers, etc.) or None on error.
+        """
+        if len(frame) < 5:  # min: unit + function + 1-byte + CRC(2)
+            return False, None
+
+        # Check CRC
+        received_crc = struct.unpack('<H', frame[-2:])[0]
+        computed_crc = self._modbus_crc16(frame[:-2])
+        if received_crc != computed_crc:
+            return False, None
+
+        unit = frame[0]
+        function = frame[1]
+
+        if unit != expected_unit:
+            return False, None
+
+        # Check for exception response (function code has high bit set)
+        if function & 0x80:
+            return False, None
+
+        if function != expected_function:
+            return False, None
+
+        # Extract data (everything between function code and CRC)
+        data = frame[2:-2]
+        return True, data
+
+    async def modbus_read_holding_registers(self, unit: int, address: int, count: int) -> Optional[List[int]]:
+        """Read holding registers (FC03) using the shared transport.
+
+        Returns list of register values (16-bit ints) or None on error.
+        """
+        if not self.running:
+            return None
+
+        # If we're using the ConnectionManager with a serial:// URI, some
+        # environments have trouble with pyserial-asyncio. Mirror the CLI
+        # behavior by using a blocking pymodbus serial client in a thread
+        # for reads when the URI is serial-based.
+        # If manager is present and manages the serial transport, use its
+        # blocking-send/receive helper so we don't open the serial device twice.
+        if self._use_manager and self._manager and self.uri and self.uri.startswith("serial://"):
+            try:
+                req = self._build_modbus_request(unit, 0x03, struct.pack('>HH', address, count))
+                # use ConnectionManager's blocking API to send and wait for response
+                frame = self._manager.send_and_receive_blocking(req, timeout=2.0)
+            except Exception:
+                logger.exception("modbus_read_holding_registers: manager blocking send/receive failed")
+                return None
+
+            success, payload = self._parse_modbus_response(frame, unit, 0x03)
+            if not success or payload is None:
+                return None
+
+            if len(payload) < 1:
+                return None
+            byte_count = payload[0]
+            if len(payload) < 1 + byte_count:
+                return None
+
+            registers = []
+            for i in range(count):
+                offset = 1 + i * 2
+                if offset + 1 < len(payload):
+                    reg_val = struct.unpack('>H', payload[offset:offset+2])[0]
+                    registers.append(reg_val)
+            return registers
+
+        # Build FC03 request: address(2) + count(2)
+        data = struct.pack('>HH', address, count)
+        request = self._build_modbus_request(unit, 0x03, data)
+
+        async with self.request_write_access():
+            await self.send_data(request)
+            # Wait for response with timeout
+            try:
+                response = await asyncio.wait_for(self._read_one_frame(), timeout=2.0)
+            except asyncio.TimeoutError:
+                return None
+
+        success, payload = self._parse_modbus_response(response, unit, 0x03)
+        if not success or payload is None:
+            return None
+
+        # FC03 response: byte_count(1) + register_values(2*count)
+        if len(payload) < 1:
+            return None
+        byte_count = payload[0]
+        if len(payload) < 1 + byte_count:
+            return None
+
+        registers = []
+        for i in range(count):
+            offset = 1 + i * 2
+            if offset + 1 < len(payload):
+                reg_val = struct.unpack('>H', payload[offset:offset+2])[0]
+                registers.append(reg_val)
+
+        return registers
+
+    async def modbus_write_registers(self, unit: int, address: int, values: List[int]) -> bool:
+        """Write multiple holding registers (FC16) using the shared transport.
+
+        Returns True on success, False on error.
+        """
+        if not self.running:
+            return False
+
+        count = len(values)
+        byte_count = count * 2
+        data = struct.pack('>HHB', address, count, byte_count)
+        for val in values:
+            data += struct.pack('>H', val)
+
+        request = self._build_modbus_request(unit, 0x10, data)
+
+        async with self.request_write_access():
+            await self.send_data(request)
+            try:
+                response = await asyncio.wait_for(self._read_one_frame(), timeout=2.0)
+            except asyncio.TimeoutError:
+                return False
+
+        success, payload = self._parse_modbus_response(response, unit, 0x10)
+        return success
+
+    async def _read_one_frame(self) -> bytes:
+        """Read one complete Modbus frame from the transport.
+
+        This is a simplified implementation that reads available bytes and attempts
+        to detect frame boundaries. For production use, a proper state machine with
+        inter-frame timeouts would be needed.
+        """
+        # For now, wait for the manager/transport to return one chunk
+        # (assumes transport.receive() returns one complete frame or a reasonable chunk)
+        if self._use_manager and self._manager:
+            frame = await self._manager.receive()
+            logger.debug("_read_one_frame: received %s bytes: %s", len(frame), frame.hex().upper())
+            return frame
+        else:
+            frame = await self.transport.receive()
+            logger.debug("_read_one_frame: received %s bytes: %s", len(frame), frame.hex().upper())
+            return frame

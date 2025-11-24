@@ -2,6 +2,7 @@ import asyncio
 from typing import Optional
 
 import serial_asyncio
+import logging
 
 from .base import TransportInterface
 
@@ -20,6 +21,11 @@ class SerialTransport(TransportInterface):
         if self.connected:
             return
         # serial_asyncio.open_serial_connection returns (reader, writer)
+        try:
+            logger = logging.getLogger("umdt.transports.serial")
+            logger.debug("SerialTransport.connect: opening port=%s baud=%s", self.port, self.baudrate)
+        except Exception:
+            pass
         self.reader, self.writer = await serial_asyncio.open_serial_connection(url=self.port, baudrate=self.baudrate)
         self.connected = True
         self._rx_task = asyncio.create_task(self._rx_loop())
