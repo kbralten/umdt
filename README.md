@@ -31,6 +31,17 @@ pip install -r requirements.txt
         - Pair (32-bit) decode: `python main_cli.py decode 0x4120 0x0000`
     - Shows tables for Big/Little (16-bit) or Big/Little/Mid-* (32-bit) permutations and prints Hex/UInt/Int/Float interpretations.
 
+- `scan` — Scan a range of Modbus addresses to discover readable registers.
+    - Requires `--serial/--baud` or `--host/--port` (connection method is required; wizard is not available).
+    - Accepts start and end addresses as positional arguments (decimal or `0xHEX`): e.g., `scan 0 100` or `scan 0x0000 0x00FF`.
+    - `--datatype` (or `-d`) selects which register type to scan: `holding|input|coil|discrete` (default: `holding`).
+    - Attempts to read each address in the range as a single register/coil. Only prints addresses that return successful reads; errors are silently ignored.
+    - Output format matches input: if either address is specified in hex, results are printed in hex; otherwise decimal.
+    - Shows live progress as addresses are found and prints a summary count when complete.
+    - Usage examples:
+        - `python main_cli.py scan 0 100 --host 192.168.1.10` — scan holding registers 0-100 via TCP
+        - `python main_cli.py scan 0x0000 0x00FF --serial COM5 --datatype coil` — scan coils 0-255 via serial
+
 - `write` — Write 16-bit or 32-bit values to a device.
     - Connection/wizard behavior mirrors `read`.
     - `--address` required.
@@ -75,6 +86,18 @@ Write a 32-bit float (Float32) to address 0 (two registers):
 python main_cli.py write --serial COM5 --baud 115200 --address 0 --long --float -12.5
 ```
 
+Scan for readable holding registers in range 0-100:
+
+```bash
+python main_cli.py scan 0 100 --host 192.168.1.10
+```
+
+Scan for readable coils using hex addresses:
+
+```bash
+python main_cli.py scan 0x0000 0x00FF --serial COM5 --baud 115200 --datatype coil
+```
+
 ## GUI (interactive)
 A PySide6/qasync-based GUI is included as an interactive alternative to the CLI. It mirrors the main CLI functionality for `read`, `monitor`, and `write` while providing richer per-value decoding and a live view of activity.
 
@@ -83,6 +106,7 @@ A PySide6/qasync-based GUI is included as an interactive alternative to the CLI.
 - Tabs:
     - **Interact** — single-shot `Read` and `Write` panels with input validation, an immediate results table, and a details panel that shows per-endian decoding (Hex, UInt/Int, Float16/Float32). `--long` (32-bit) reads show 32-bit permutations; single-register reads show Big/Little 16-bit interpretations.
     - **Monitor** — continuous polling with a scrolling history table and selectable rows. Selected rows populate the same decoding details panel. Monitor supports configurable poll interval and error/highlight rows for failed polls.
+    - **Scan** — address range scanner that discovers readable registers/coils. Enter start and end addresses (decimal or hex), select data type from the top connection panel, and click "Start Scan". Results appear in real-time showing decimal address, hex address, and "Readable" status. Readable addresses are highlighted in green. Progress is shown during scan ("Scanning 25/100 (found 8)..."). Use "Stop" to cancel and "Clear Results" to reset the table.
 - Details panel: when a table row is selected the details widget shows multiple endian permutations and numeric interpretations (mirrors `--endian all` behavior for single-value reads). For 32-bit longs the GUI shows the four common permutations (Big/Little/Mid-Big/Mid-Little).
 - Locking and transport: the GUI integrates with `CoreController` where available to reuse shared transport and locking semantics; when a controller isn't started the GUI falls back to thread-wrapped blocking reads/writes (same `pymodbus` compatibility layer used by the CLI).
 - Log view & status: lightweight log area shows recent operations (reads/writes/status) and a color-coded status label indicates connection state.

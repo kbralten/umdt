@@ -949,14 +949,19 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.interact_tab = QWidget()
         self.monitor_tab = QWidget()
+        self.scan_tab = QWidget()
         self.tabs.addTab(self.interact_tab, "Interact")
         self.tabs.addTab(self.monitor_tab, "Monitor")
+        self.tabs.addTab(self.scan_tab, "Scan")
 
         # Build Interact tab layout (Read / Write panels)
         self._build_interact_tab()
 
         # Build Monitor tab layout
         self._build_monitor_tab()
+
+        # Build Scan tab layout
+        self._build_scan_tab()
 
         root_layout.addWidget(self.tabs)
 
@@ -970,6 +975,8 @@ class MainWindow(QMainWindow):
         self._read_lock = asyncio.Lock()
         # Monitor polling task
         self._monitor_task: Optional[asyncio.Task] = None
+        # Scan task
+        self._scan_task: Optional[asyncio.Task] = None
         # Store connection state: None = disconnected, str = URI
         self._connection_uri: Optional[str] = None
 
@@ -1218,6 +1225,62 @@ class MainWindow(QMainWindow):
             self.monitor_table.selectionModel().selectionChanged.connect(self.on_monitor_selection_changed)
         except Exception:
             pass
+
+    def _build_scan_tab(self) -> None:
+        """Build the Scan tab UI with address range scanning."""
+        layout = QVBoxLayout()
+
+        # --- Scan configuration panel ---
+        config_row = QHBoxLayout()
+
+        self.scan_start_edit = QLineEdit()
+        self.scan_start_edit.setPlaceholderText("Start (e.g. 0 or 0x0000)")
+        self.scan_start_edit.setText("0")
+        self.scan_start_edit.setMaximumWidth(150)
+
+        self.scan_end_edit = QLineEdit()
+        self.scan_end_edit.setPlaceholderText("End (e.g. 100 or 0x0064)")
+        self.scan_end_edit.setText("100")
+        self.scan_end_edit.setMaximumWidth(150)
+
+        config_row.addWidget(QLabel("Start Address:"))
+        config_row.addWidget(self.scan_start_edit)
+        config_row.addWidget(QLabel("End Address:"))
+        config_row.addWidget(self.scan_end_edit)
+
+        self.btn_scan_start = QPushButton("Start Scan")
+        self.btn_scan_stop = QPushButton("Stop")
+        self.btn_scan_stop.setEnabled(False)
+        self.btn_scan_clear = QPushButton("Clear Results")
+
+        config_row.addWidget(self.btn_scan_start)
+        config_row.addWidget(self.btn_scan_stop)
+        config_row.addWidget(self.btn_scan_clear)
+        config_row.addStretch()
+
+        layout.addLayout(config_row)
+
+        # --- Scan status ---
+        self.scan_status_label = QLabel("Ready to scan")
+        layout.addWidget(self.scan_status_label)
+
+        # --- Scan results table ---
+        self.scan_table = QTableWidget()
+        self.scan_table.setColumnCount(3)
+        self.scan_table.setHorizontalHeaderLabels(["Address (Dec)", "Address (Hex)", "Status"])
+        header = self.scan_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.Stretch)
+        self.scan_table.verticalHeader().setVisible(False)
+        layout.addWidget(self.scan_table)
+
+        self.scan_tab.setLayout(layout)
+
+        # Wire buttons
+        self.btn_scan_start.clicked.connect(self.on_scan_start_clicked)
+        self.btn_scan_stop.clicked.connect(self.on_scan_stop_clicked)
+        self.btn_scan_clear.clicked.connect(self.on_scan_clear_clicked)
 
     def build_uri(self) -> str:
         """Build a connection URI from the connection panel fields.
@@ -1497,6 +1560,133 @@ class MainWindow(QMainWindow):
                 self.on_monitor_selection_changed()
         except Exception:
             pass
+
+    @qasync.asyncSlot()
+    async def on_scan_start_clicked(self):
+        """Start scanning the address range."""
+        # Require connection
+        if self._connection_uri is None:
+            QMessageBox.warning(self, "Not connected", "Please connect first using the Connect button.")
+            return
+
+        # Parse addresses
+        start_text = self.scan_start_edit.text().strip()
+        end_text = self.scan_end_edit.text().strip()
+        
+        start_addr = self._parse_address(start_text)
+        end_addr = self._parse_address(end_text)
+        
+        if start_addr is None or end_addr is None:
+            QMessageBox.warning(self, "Invalid address", "Enter valid start and end addresses (decimal or 0xHEX).")
+            return
+        
+        if start_addr > end_addr:
+            QMessageBox.warning(self, "Invalid range", "Start address must be <= end address.")
+            return
+
+        # Get data type and unit
+        data_type = self._current_data_type()
+        unit = self._parse_int(self.unit_edit.text()) or 1
+
+        # Check if already scanning
+        if self._scan_task is not None and not self._scan_task.done():
+            QMessageBox.information(self, "Scan in progress", "A scan is already running.")
+            return
+
+        # Update UI state
+        self.btn_scan_start.setEnabled(False)
+        self.btn_scan_stop.setEnabled(True)
+        self.scan_status_label.setText(f"Scanning {start_addr} to {end_addr}...")
+
+        # Start scan task
+        self._scan_task = asyncio.create_task(
+            self._run_scan(start_addr, end_addr, data_type, unit)
+        )
+
+    @qasync.asyncSlot()
+    async def on_scan_stop_clicked(self):
+        """Stop the current scan."""
+        if self._scan_task is not None and not self._scan_task.done():
+            self._scan_task.cancel()
+            try:
+                await self._scan_task
+            except asyncio.CancelledError:
+                pass
+            self.scan_status_label.setText("Scan stopped")
+        self.btn_scan_start.setEnabled(True)
+        self.btn_scan_stop.setEnabled(False)
+
+    @qasync.asyncSlot()
+    async def on_scan_clear_clicked(self):
+        """Clear scan results table."""
+        self.scan_table.setRowCount(0)
+        self.scan_status_label.setText("Ready to scan")
+
+    async def _run_scan(self, start_addr: int, end_addr: int, data_type: DataType, unit: int):
+        """Perform the scan operation in background."""
+        found_count = 0
+        total_count = end_addr - start_addr + 1
+        
+        try:
+            for addr in range(start_addr, end_addr + 1):
+                # Check for cancellation
+                if self._scan_task.cancelled():
+                    break
+                
+                # Update status
+                progress = addr - start_addr + 1
+                self.scan_status_label.setText(
+                    f"Scanning {progress}/{total_count} (found {found_count})..."
+                )
+                
+                # Attempt to read single register/coil at this address
+                try:
+                    await self._read_rows(
+                        addr,
+                        1,  # count = 1
+                        False,  # long_mode = False
+                        "big",  # endian
+                        False,  # decode
+                        data_type,
+                        unit,
+                        self._connection_uri,
+                    )
+                    
+                    # Success - add to table
+                    found_count += 1
+                    row_position = self.scan_table.rowCount()
+                    self.scan_table.insertRow(row_position)
+                    self.scan_table.setItem(row_position, 0, QTableWidgetItem(str(addr)))
+                    self.scan_table.setItem(row_position, 1, QTableWidgetItem(hex(addr)))
+                    self.scan_table.setItem(row_position, 2, QTableWidgetItem("Readable"))
+                    
+                    # Color the row green
+                    for col in range(3):
+                        item = self.scan_table.item(row_position, col)
+                        if item:
+                            item.setBackground(QBrush(QColor(200, 255, 200)))
+                    
+                except Exception:
+                    # Silently ignore errors (address not readable)
+                    pass
+                
+                # Small delay to keep UI responsive
+                await asyncio.sleep(0.01)
+            
+            # Scan complete
+            self.scan_status_label.setText(
+                f"Scan complete. Found {found_count} readable address(es) out of {total_count}."
+            )
+            
+        except asyncio.CancelledError:
+            self.scan_status_label.setText("Scan cancelled")
+            raise
+        except Exception as e:
+            self.scan_status_label.setText(f"Scan error: {e}")
+            QMessageBox.critical(self, "Scan Error", f"An error occurred during scan: {e}")
+        finally:
+            self.btn_scan_start.setEnabled(True)
+            self.btn_scan_stop.setEnabled(False)
 
     def _format_register_details(self, regs: List[int], start_addr: int, endian: str) -> str:
         """Format detailed decoding for a list of 16-bit registers."""

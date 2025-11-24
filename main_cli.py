@@ -674,6 +674,104 @@ def ports():
 
 
 @app.command()
+def scan(
+    start: str = typer.Argument(..., help="Start address (decimal or 0xHEX)"),
+    end: str = typer.Argument(..., help="End address (decimal or 0xHEX)"),
+    serial: Optional[str] = typer.Option(None, help="Serial port (e.g. COM5) to scan"),
+    baud: int = typer.Option(9600, help="Baud rate for serial"),
+    host: Optional[str] = typer.Option(None, help="Modbus TCP host"),
+    port: int = typer.Option(502, help="Modbus TCP port"),
+    unit: int = typer.Option(1, help="Modbus unit id"),
+    datatype: str = typer.Option("holding", "--datatype", "-d", help="Data type: holding|input|coil|discrete"),
+):
+    """Scan a range of Modbus addresses to find readable registers.
+
+    Attempts to read each address in the range as a single register/coil.
+    Only prints addresses that return successful reads (errors are silently ignored).
+
+    Examples:
+      - Scan holding registers: `umdt scan 0 100 --host 192.168.1.10`
+      - Scan serial coils: `umdt scan 0x0000 0x00FF --serial COM5 --datatype coil`
+    """
+    # Validate connection method
+    conn_methods = sum(bool(x) for x in (serial, host))
+    if conn_methods != 1:
+        console.print("Specify exactly one of --serial or --host")
+        raise typer.Exit(code=1)
+
+    if not _HAS_PYMODBUS:
+        console.print("pymodbus is required for scanning")
+        raise typer.Exit(code=1)
+
+    # Parse data type
+    try:
+        data_type = parse_data_type(datatype)
+    except ValueError as exc:
+        console.print(str(exc))
+        raise typer.Exit(code=1)
+
+    props = DATA_TYPE_PROPERTIES[data_type]
+    if not props.readable or not props.pymodbus_read_method:
+        console.print(f"Data type '{data_type.value}' is not readable")
+        raise typer.Exit(code=1)
+
+    # Parse start/end addresses and detect if hex was used
+    start_was_hex = start.strip().lower().startswith("0x")
+    end_was_hex = end.strip().lower().startswith("0x")
+    
+    try:
+        start_addr = int(start, 0)
+        end_addr = int(end, 0)
+    except Exception:
+        console.print("Invalid address format; use decimal or 0xHEX")
+        raise typer.Exit(code=1)
+
+    if start_addr > end_addr:
+        console.print("Start address must be <= end address")
+        raise typer.Exit(code=1)
+
+    # Determine output format (use hex if either bound was specified in hex)
+    use_hex = start_was_hex or end_was_hex
+
+    # Create client
+    if serial:
+        sp = _normalize_serial_port(serial)
+        client = ModbusSerialClient(port=sp, baudrate=baud)
+    else:
+        client = ModbusTcpClient(host, port=port)
+
+    if not client.connect():
+        console.print("Failed to connect")
+        raise typer.Exit(code=1)
+
+    try:
+        console.print(f"Scanning {start_addr} to {end_addr} ({end_addr - start_addr + 1} addresses)...")
+        successful = []
+        
+        for addr in range(start_addr, end_addr + 1):
+            try:
+                # Read single register/coil at this address
+                rr = call_read_method(client, props.pymodbus_read_method, addr, 1, unit)
+                
+                # Check if successful
+                if rr is not None and not (hasattr(rr, 'isError') and rr.isError()):
+                    successful.append(addr)
+                    # Print immediately for live feedback
+                    if use_hex:
+                        console.print(f"  {hex(addr)}")
+                    else:
+                        console.print(f"  {addr}")
+            except Exception:
+                # Silently ignore errors
+                pass
+
+        console.print(f"\nScan complete. Found {len(successful)} readable address(es).")
+        
+    finally:
+        client.close()
+
+
+@app.command()
 def write(
     serial: Optional[str] = typer.Option(None, help="Serial port (e.g. COM5) to write to"),
     baud: int = typer.Option(9600, help="Baud rate for serial"),
