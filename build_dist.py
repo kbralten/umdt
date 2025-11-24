@@ -58,7 +58,12 @@ def build(cli_name: str = "umdt", gui_name: str = "umdt_gui"):
         print("Skipping mock server CLI: entry not found")
 
     print("Building GUI executable (windowed/no-console) with icon...")
-    gui_args = common_args + ["--name", gui_name, "--noconsole", gui_entry]
+    gui_args = list(common_args)
+    # Ensure the runtime icon file is bundled so the app can load it from the onefile bundle
+    if os.path.exists(ICON_PATH):
+        gui_args += ["--add-data", f"{ICON_PATH}{os.pathsep}."]
+    gui_args += ["--name", gui_name, "--noconsole", gui_entry]
+    # Use the icon as the executable icon as well (resource)
     if os.path.exists(ICON_PATH):
         gui_args[3:3] = ["--icon", ICON_PATH]
     subprocess.check_call(gui_args)
@@ -67,8 +72,15 @@ def build(cli_name: str = "umdt", gui_name: str = "umdt_gui"):
     if os.path.exists(mock_gui_entry):
         mock_gui_name = "umdt_mock_server_gui"
         print("Building mock server GUI executable (windowed/no-console) with icon...")
-        mock_gui_args = common_args + ["--name", mock_gui_name, "--noconsole", mock_gui_entry]
-        # Prefer dedicated mock icon if present
+        mock_gui_args = list(common_args)
+        # Bundle mock icon so runtime can load it
+        if os.path.exists(MOCK_ICON_PATH):
+            mock_gui_args += ["--add-data", f"{MOCK_ICON_PATH}{os.pathsep}."]
+        # Also bundle main icon as fallback
+        if os.path.exists(ICON_PATH):
+            mock_gui_args += ["--add-data", f"{ICON_PATH}{os.pathsep}."]
+        mock_gui_args += ["--name", mock_gui_name, "--noconsole", mock_gui_entry]
+        # Prefer executable icon from mock icon if present
         if os.path.exists(MOCK_ICON_PATH):
             mock_gui_args[3:3] = ["--icon", MOCK_ICON_PATH]
         elif os.path.exists(ICON_PATH):
@@ -79,18 +91,6 @@ def build(cli_name: str = "umdt", gui_name: str = "umdt_gui"):
 
     print("Build complete. Dist folder:")
     dist_dir = os.path.join(ROOT, "dist")
-    # Ensure dist directory exists and copy icons if present
-    try:
-        os.makedirs(dist_dir, exist_ok=True)
-        if os.path.exists(ICON_PATH):
-            shutil.copy2(ICON_PATH, dist_dir)
-            print(f"Copied icon to {dist_dir}")
-        if os.path.exists(MOCK_ICON_PATH):
-            shutil.copy2(MOCK_ICON_PATH, dist_dir)
-            print(f"Copied mock icon to {dist_dir}")
-    except Exception as e:
-        print(f"Warning: failed to copy icons to dist folder: {e}")
-
     print(dist_dir)
 
 

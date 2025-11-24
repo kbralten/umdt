@@ -845,8 +845,9 @@ def run_gui_write(
         except Exception:
             pass
 
-# project icon (placed next to main scripts)
-ICON_PATH = os.path.join(os.path.dirname(__file__), "umdt.ico")
+# project icon (placed next to main scripts or bundled by PyInstaller into _MEIPASS)
+_RESOURCE_BASE = getattr(sys, '_MEIPASS', os.path.dirname(__file__))
+ICON_PATH = os.path.join(_RESOURCE_BASE, "umdt.ico")
 
 class MainWindow(QMainWindow):
     def __init__(self):

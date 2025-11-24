@@ -65,6 +65,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setWindowTitle("UMDT Mock Modbus Server")
         self.resize(900, 600)
 
+        # Ensure the main window and taskbar use the mock icon when available
+        try:
+            resource_base = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))
+            ico_path = resource_base / "umdt_mock.ico"
+            if ico_path.exists():
+                icon = QtGui.QIcon(str(ico_path))
+                self.setWindowIcon(icon)
+                app = QtWidgets.QApplication.instance()
+                if app is not None:
+                    app.setWindowIcon(icon)
+        except Exception:
+            pass
+
         self.device: Optional[MockDevice] = None
         self.coordinator: Optional[TransportCoordinator] = None
         self._event_task: Optional[asyncio.Task] = None
