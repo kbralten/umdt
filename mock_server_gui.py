@@ -5,7 +5,7 @@ from pathlib import Path
 import sys
 from typing import Optional
 
-from PySide6 import QtCore, QtWidgets
+from PySide6 import QtCore, QtWidgets, QtGui
 import qasync
 
 from umdt.core.data_types import DataType
@@ -509,10 +509,24 @@ class MainWindow(QtWidgets.QMainWindow):
 
 def main() -> None:
     app = QtWidgets.QApplication(sys.argv)
+    # Use a dedicated mock-server icon if available so taskbar and window show it
+    try:
+        ico_path = Path(__file__).resolve().parent / "umdt_mock.ico"
+        if ico_path.exists():
+            app_icon = QtGui.QIcon(str(ico_path))
+            app.setWindowIcon(app_icon)
+    except Exception:
+        pass
     loop = qasync.QEventLoop(app)
     asyncio.set_event_loop(loop)
 
     window = MainWindow()
+    # Ensure main window uses the same icon (affects taskbar on Windows)
+    try:
+        if 'app_icon' in locals():
+            window.setWindowIcon(app_icon)
+    except Exception:
+        pass
     window.show()
 
     with loop:
