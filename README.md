@@ -42,6 +42,24 @@ pip install -r requirements.txt
         - `python main_cli.py scan 0 100 --host 192.168.1.10` — scan holding registers 0-100 via TCP
         - `python main_cli.py scan 0x0000 0x00FF --serial COM5 --datatype coil` — scan coils 0-255 via serial
 
+- `probe` — Discover working Modbus connections by testing combinations of connection parameters.
+    - Performs combinatorial search across connection parameters to find responsive devices.
+    - **TCP Mode:** Specify `--hosts` and `--ports` (supports CSV lists and ranges: `192.168.1.10,192.168.1.11` or `500-550`).
+    - **Serial Mode:** Specify `--serials` and `--bauds` (supports CSV: `COM3,COM4` and `9600,115200`).
+    - `--units` specifies Modbus unit IDs to test (supports ranges: `1-10` or CSV: `1,5,10`).
+    - `--address` and `--datatype` specify the target register to probe (default: holding register 0).
+    - `--timeout` sets per-probe timeout in milliseconds (default: 200ms).
+    - `--concurrency` controls maximum parallel probes for TCP (serial is always sequential to avoid port conflicts).
+    - `--attempts` sets retry count per combination (default: 1).
+    - `--backoff` sets delay between retries in milliseconds (default: 100ms).
+    - `--output` exports results to JSON file.
+    - `--alive-only` displays only responsive devices (default behavior).
+    - Shows live feedback as devices are discovered and prints summary statistics.
+    - Usage examples:
+        - `python main_cli.py probe --hosts 192.168.1.10-192.168.1.20 --ports 502,5020 --units 1-10` — probe TCP range
+        - `python main_cli.py probe --serials COM3,COM4 --bauds 9600,19200,115200 --units 1-5` — probe serial ports
+        - `python main_cli.py probe --hosts 10.0.0.1 --ports 500-550 --output results.json` — export to JSON
+
 - `write` — Write 16-bit or 32-bit values to a device.
     - Connection/wizard behavior mirrors `read`.
     - `--address` required.
@@ -98,6 +116,18 @@ Scan for readable coils using hex addresses:
 python main_cli.py scan 0x0000 0x00FF --serial COM5 --baud 115200 --datatype coil
 ```
 
+Probe TCP network for devices on ports 502 and 5020:
+
+```bash
+python main_cli.py probe --hosts 192.168.1.1-192.168.1.254 --ports 502,5020 --units 1-10
+```
+
+Probe serial ports for devices at multiple baud rates:
+
+```bash
+python main_cli.py probe --serials COM3,COM4,COM5 --bauds 9600,19200,115200 --units 1-5 --output found.json
+```
+
 ## GUI (interactive)
 A PySide6/qasync-based GUI is included as an interactive alternative to the CLI. It mirrors the main CLI functionality for `read`, `monitor`, and `write` while providing richer per-value decoding and a live view of activity.
 
@@ -107,6 +137,7 @@ A PySide6/qasync-based GUI is included as an interactive alternative to the CLI.
     - **Interact** — single-shot `Read` and `Write` panels with input validation, an immediate results table, and a details panel that shows per-endian decoding (Hex, UInt/Int, Float16/Float32). `--long` (32-bit) reads show 32-bit permutations; single-register reads show Big/Little 16-bit interpretations.
     - **Monitor** — continuous polling with a scrolling history table and selectable rows. Selected rows populate the same decoding details panel. Monitor supports configurable poll interval and error/highlight rows for failed polls.
     - **Scan** — address range scanner that discovers readable registers/coils. Enter start and end addresses (decimal or hex), select data type from the top connection panel, and click "Start Scan". Results appear in real-time showing decimal address, hex address, and "Readable" status. Readable addresses are highlighted in green. Progress is shown during scan ("Scanning 25/100 (found 8)..."). Use "Stop" to cancel and "Clear Results" to reset the table.
+    - **Probe** — connection discovery tool that tests combinations of connection parameters to find responsive devices. Enter comma-separated or range values for hosts/ports (TCP mode) or serials/bauds (serial mode), plus unit IDs to test. Configure timeout, concurrency, retry attempts, and backoff delay. Click "Start Probe" to begin combinatorial search. Results table shows only alive endpoints with connection URI, response summary, and response time. Supports large search spaces (warns if >1000 combinations). Use "Stop" to cancel, "Clear" to reset results, and "Export" to save findings to JSON. Serial probes run sequentially to avoid port conflicts; TCP probes run concurrently up to configured limit.
 - Details panel: when a table row is selected the details widget shows multiple endian permutations and numeric interpretations (mirrors `--endian all` behavior for single-value reads). For 32-bit longs the GUI shows the four common permutations (Big/Little/Mid-Big/Mid-Little).
 - Locking and transport: the GUI integrates with `CoreController` where available to reuse shared transport and locking semantics; when a controller isn't started the GUI falls back to thread-wrapped blocking reads/writes (same `pymodbus` compatibility layer used by the CLI).
 - Log view & status: lightweight log area shows recent operations (reads/writes/status) and a color-coded status label indicates connection state.
