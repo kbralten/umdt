@@ -16,7 +16,14 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 from urllib.parse import urlparse, parse_qs
 
 from umdt.core.data_types import DATA_TYPE_PROPERTIES, DataType, is_bit_type
-from umdt.utils.modbus_compat import call_read_method
+from umdt.utils.modbus_compat import (
+    create_client,
+    close_client,
+    read_holding_registers,
+    read_input_registers,
+    read_coils,
+    read_discrete_inputs,
+)
 
 DEFAULT_TIMEOUT_MS = 100
 
@@ -214,12 +221,6 @@ class Prober:
 
         Returns (alive: bool, summary: Optional[str]).
         """
-        # Import pymodbus sync clients lazily to avoid import-time issues
-        try:
-            from pymodbus.client import ModbusTcpClient, ModbusSerialClient
-        except Exception:
-            from pymodbus.client.sync import ModbusTcpClient, ModbusSerialClient  # type: ignore
-
         parsed = urlparse(uri)
         scheme = parsed.scheme or 'serial'
         qs = parse_qs(parsed.query or "")
@@ -248,21 +249,18 @@ class Prober:
                 else:
                     port = netloc or params.get('serial')
                     baud = params.get('baud')
+                # Create a compat client and disable retries for serial probes
                 try:
-                    # Disable pymodbus internal retries for serial (retries=0)
-                    client = ModbusSerialClient(port=port, baudrate=baud, timeout=timeout_s, retries=0)
+                    client = create_client(kind='serial', serial_port=port, baudrate=baud, timeout=timeout_s, retries=0)
                 except Exception:
-                    try:
-                        client = ModbusSerialClient(port=port, baudrate=baud, retries=0)
-                    except Exception:
-                        client = ModbusSerialClient(port=port, baudrate=baud)
+                    client = create_client(kind='serial', serial_port=port, baudrate=baud)
             else:
                 host = parsed.hostname or params.get('host') or '127.0.0.1'
                 tcp_port = parsed.port or int(params.get('port', 502))
                 try:
-                    client = ModbusTcpClient(host, port=tcp_port, timeout=timeout_s)
+                    client = create_client(kind='tcp', host=host, port=tcp_port, timeout=timeout_s)
                 except Exception:
-                    client = ModbusTcpClient(host, port=tcp_port)
+                    client = create_client(kind='tcp', host=host, port=tcp_port)
 
             # Connect
             try:
@@ -271,7 +269,7 @@ class Prober:
                 # Ensure client is closed on connection error
                 try:
                     if client:
-                        client.close()
+                        close_client(client)
                 except Exception:
                     pass
                 return False, f"connect-error: {e}"
@@ -279,7 +277,7 @@ class Prober:
                 # Ensure client is closed on connection failure
                 try:
                     if client:
-                        client.close()
+                        close_client(client)
                 except Exception:
                     pass
                 return False, "connect-failed"
@@ -292,16 +290,27 @@ class Prober:
             regs_to_read = 1 if not is_bit_type(target.datatype) else 1
 
             try:
-                rr = call_read_method(client, props.pymodbus_read_method, target.address, regs_to_read, unit)
+                _read_map = {
+                    'read_holding_registers': read_holding_registers,
+                    'read_input_registers': read_input_registers,
+                    'read_coils': read_coils,
+                    'read_discrete_inputs': read_discrete_inputs,
+                }
+                reader = _read_map.get(props.pymodbus_read_method)
+                if reader:
+                    rr = reader(client, target.address, regs_to_read, unit)
+                else:
+                    from umdt.utils.modbus_compat import invoke_method
+                    rr = invoke_method(client, props.pymodbus_read_method, target.address, regs_to_read, unit)
             except Exception as e:
                 try:
-                    client.close()
+                    close_client(client)
                 except Exception:
                     pass
                 return False, f"read-error: {e}"
 
             try:
-                client.close()
+                close_client(client)
             except Exception:
                 pass
 

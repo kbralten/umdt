@@ -13,7 +13,20 @@ from umdt.core.data_types import (
     is_register_type,
     parse_data_type,
 )
-from umdt.utils.modbus_compat import call_read_method, call_write_method
+from umdt.utils.modbus_compat import (
+    create_client,
+    close_client,
+)
+from umdt.utils.modbus_compat import (
+    read_holding_registers,
+    read_input_registers,
+    read_coils,
+    read_discrete_inputs,
+    write_registers,
+    write_register,
+    write_coil,
+    write_coils,
+)
 
 # serial port listing (optional)
 _HAS_PYSERIAL = True
@@ -407,11 +420,17 @@ def read(
         client = None
         if serial:
             sp = _normalize_serial_port(serial)
-            client = ModbusSerialClient(port=sp, baudrate=baud)
+            if 'ModbusSerialClient' in globals() and ModbusSerialClient is not None:
+                client = ModbusSerialClient(port=sp, baudrate=baud)
+            else:
+                client = create_client(kind='serial', serial_port=sp, baudrate=baud)
         else:
-            client = ModbusTcpClient(host, port=port)
+            if 'ModbusTcpClient' in globals() and ModbusTcpClient is not None:
+                client = ModbusTcpClient(host, port=port)
+            else:
+                client = create_client(kind='tcp', host=host, port=port)
 
-        if not client.connect():
+        if not getattr(client, 'connect', lambda: True)():
             console.print("Failed to connect")
             raise typer.Exit(code=1)
 
@@ -436,13 +455,13 @@ def read(
                 regs_to_read = num_values * (2 if long else 1)
                 if regs_to_read > 125:
                     console.print(f"Requested {regs_to_read} registers exceeds Modbus limit of 125")
-                    client.close()
+                    close_client(client)
                     raise typer.Exit(code=1)
             else:
                 regs_to_read = num_values
                 if regs_to_read > 2000:
                     console.print("Requested coil/input count exceeds Modbus limit of 2000")
-                    client.close()
+                    close_client(client)
                     raise typer.Exit(code=1)
 
             # normalize endian option
@@ -464,11 +483,25 @@ def read(
                 client.close()
                 raise typer.Exit(code=1)
 
+            # Perform read using compat wrappers (or fallback to client method)
             try:
-                rr = call_read_method(client, props.pymodbus_read_method, numeric_address, regs_to_read, unit)
+                _read_map = {
+                    'read_holding_registers': read_holding_registers,
+                    'read_input_registers': read_input_registers,
+                    'read_coils': read_coils,
+                    'read_discrete_inputs': read_discrete_inputs,
+                }
+                reader = _read_map.get(props.pymodbus_read_method)
+                if reader:
+                    rr = reader(client, numeric_address, regs_to_read, unit)
+                else:
+                    fn = getattr(client, props.pymodbus_read_method, None)
+                    if fn is None:
+                        raise AttributeError(f"Client does not support {props.pymodbus_read_method}")
+                    rr = fn(numeric_address, regs_to_read, unit)
             except AttributeError as exc:
                 console.print(str(exc))
-                client.close()
+                close_client(client)
                 raise typer.Exit(code=1)
 
             values, err = _extract_values(rr, is_bit_type(data_type))
@@ -495,7 +528,7 @@ def read(
                     bit_label = "Coil" if data_type == DataType.COIL else "Input"
                     _present_bits(numeric_address, [bool(v) for v in values], address_was_hex, bit_label)
         finally:
-            client.close()
+            close_client(client)
         return
 
     # Local decode removed — use `decode` command for offline decoding
@@ -596,11 +629,17 @@ def monitor(
     client = None
     if serial:
         sp = _normalize_serial_port(serial)
-        client = ModbusSerialClient(port=sp, baudrate=baud)
+        if 'ModbusSerialClient' in globals() and ModbusSerialClient is not None:
+            client = ModbusSerialClient(port=sp, baudrate=baud)
+        else:
+            client = create_client(kind='serial', serial_port=sp, baudrate=baud)
     else:
-        client = ModbusTcpClient(host, port=port)
+        if 'ModbusTcpClient' in globals() and ModbusTcpClient is not None:
+            client = ModbusTcpClient(host, port=port)
+        else:
+            client = create_client(kind='tcp', host=host, port=port)
 
-    if not client.connect():
+    if not getattr(client, 'connect', lambda: True)():
         console.print("Failed to connect")
         raise typer.Exit(code=1)
 
@@ -651,7 +690,20 @@ def monitor(
 
         while True:
             try:
-                rr = call_read_method(client, props.pymodbus_read_method, numeric_address, regs_to_read, unit)
+                _read_map = {
+                    'read_holding_registers': read_holding_registers,
+                    'read_input_registers': read_input_registers,
+                    'read_coils': read_coils,
+                    'read_discrete_inputs': read_discrete_inputs,
+                }
+                reader = _read_map.get(props.pymodbus_read_method)
+                if reader:
+                    rr = reader(client, numeric_address, regs_to_read, unit)
+                else:
+                    fn = getattr(client, props.pymodbus_read_method, None)
+                    if fn is None:
+                        raise AttributeError(f"Client does not support {props.pymodbus_read_method}")
+                    rr = fn(numeric_address, regs_to_read, unit)
             except AttributeError as exc:
                 console.print(str(exc))
                 break
@@ -681,7 +733,7 @@ def monitor(
     except KeyboardInterrupt:
         console.print("Stopping monitor...")
     finally:
-        client.close()
+        close_client(client)
 
 
 
@@ -766,11 +818,17 @@ def scan(
     # Create client
     if serial:
         sp = _normalize_serial_port(serial)
-        client = ModbusSerialClient(port=sp, baudrate=baud)
+        if 'ModbusSerialClient' in globals() and ModbusSerialClient is not None:
+            client = ModbusSerialClient(port=sp, baudrate=baud)
+        else:
+            client = create_client(kind='serial', serial_port=sp, baudrate=baud)
     else:
-        client = ModbusTcpClient(host, port=port)
+        if 'ModbusTcpClient' in globals() and ModbusTcpClient is not None:
+            client = ModbusTcpClient(host, port=port)
+        else:
+            client = create_client(kind='tcp', host=host, port=port)
 
-    if not client.connect():
+    if not getattr(client, 'connect', lambda: True)():
         console.print("Failed to connect")
         raise typer.Exit(code=1)
 
@@ -781,7 +839,17 @@ def scan(
         for addr in range(start_addr, end_addr + 1):
             try:
                 # Read single register/coil at this address
-                rr = call_read_method(client, props.pymodbus_read_method, addr, 1, unit)
+                _read_map = {
+                    'read_holding_registers': read_holding_registers,
+                    'read_input_registers': read_input_registers,
+                    'read_coils': read_coils,
+                    'read_discrete_inputs': read_discrete_inputs,
+                }
+                reader = _read_map.get(props.pymodbus_read_method)
+                if reader:
+                    rr = reader(client, addr, 1, unit)
+                else:
+                    rr = call_read_method(client, props.pymodbus_read_method, addr, 1, unit)
                 
                 # Check if successful
                 if rr is not None and not (hasattr(rr, 'isError') and rr.isError()):
@@ -798,7 +866,7 @@ def scan(
         console.print(f"\nScan complete. Found {len(successful)} readable address(es).")
         
     finally:
-        client.close()
+        close_client(client)
 
 
 @app.command()
@@ -1064,27 +1132,54 @@ def write(
 
     if serial:
         sp = _normalize_serial_port(serial)
-        client = ModbusSerialClient(port=sp, baudrate=baud)
+        if 'ModbusSerialClient' in globals() and ModbusSerialClient is not None:
+            client = ModbusSerialClient(port=sp, baudrate=baud)
+        else:
+            client = create_client(kind='serial', serial_port=sp, baudrate=baud)
     else:
-        client = ModbusTcpClient(host, port=port)
+        if 'ModbusTcpClient' in globals() and ModbusTcpClient is not None:
+            client = ModbusTcpClient(host, port=port)
+        else:
+            client = create_client(kind='tcp', host=host, port=port)
 
-    if not client.connect():
+    if not getattr(client, 'connect', lambda: True)():
         console.print("Failed to connect")
         raise typer.Exit(code=1)
 
     try:
-        try:
-            res = call_write_method(client, props.pymodbus_write_method, numeric_address, payload_values, unit)
-        except AttributeError as exc:
-            console.print(str(exc))
-            raise typer.Exit(code=1)
+        # Prefer register-specific wrappers when available
+        if is_register_type(data_type):
+            if props.pymodbus_write_method == 'write_registers':
+                res = write_registers(client, numeric_address, payload_values, unit)
+            elif props.pymodbus_write_method == 'write_register':
+                val = payload_values[0] if isinstance(payload_values, (list, tuple)) else payload_values
+                res = write_register(client, numeric_address, val, unit)
+            else:
+                fn = getattr(client, props.pymodbus_write_method, None)
+                if fn is None:
+                    raise AttributeError(f"Client does not support {props.pymodbus_write_method}")
+                res = fn(numeric_address, payload_values, unit)
+        else:
+            # Coils: prefer wrappers
+            if props.pymodbus_write_method == 'write_coil':
+                res = write_coil(client, numeric_address, payload_values[0] if isinstance(payload_values, (list, tuple)) else payload_values, unit)
+            elif props.pymodbus_write_method == 'write_coils':
+                res = write_coils(client, numeric_address, payload_values, unit)
+            else:
+                fn = getattr(client, props.pymodbus_write_method, None)
+                if fn is None:
+                    raise AttributeError(f"Client does not support {props.pymodbus_write_method}")
+                res = fn(numeric_address, payload_values, unit)
+    except AttributeError as exc:
+        console.print(str(exc))
+        raise typer.Exit(code=1)
 
         if hasattr(res, "isError") and res.isError():
             console.print("[red]Write failed[/red]")
         else:
             console.print("[green]Write OK[/green]")
     finally:
-        client.close()
+        close_client(client)
 
 
 
