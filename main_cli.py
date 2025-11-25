@@ -5,6 +5,9 @@ from umdt.core import __version__
 from umdt.core.controller import CoreController
 from umdt.commands.builder import CommandBuilder
 from umdt.utils.ieee754 import from_bytes_to_float32, from_bytes_to_float16
+from umdt.utils.parsing import expand_csv_or_range, normalize_serial_port
+from umdt.utils.address import parse_address, format_address
+from umdt.utils.decoding import format_permutations_32, float_permutations_from_regs
 from urllib.parse import urlparse, parse_qs
 from umdt.core.data_types import (
     DATA_TYPE_PROPERTIES,
@@ -23,38 +26,11 @@ except Exception:
     _HAS_PYSERIAL = False
 
 
-def _normalize_serial_port(s: str) -> str:
-    if not s:
-        return s
-    # remove leading slashes that appear with urlparse (e.g. '/COM3')
-    return s.lstrip("/")
-
-
-def _expand_csv_or_range(s: Optional[str]) -> List[str]:
-    """Expand a CSV string and simple ranges (e.g. '1-5') into a list of strings.
-
-    Returns an empty list for None/empty input.
-    """
-    if not s:
-        return []
-    out: List[str] = []
-    for part in str(s).split(','):
-        p = part.strip()
-        if not p:
-            continue
-        if '-' in p and p.count('-') == 1:
-            a, b = p.split('-', 1)
-            try:
-                ia = int(a, 0)
-                ib = int(b, 0)
-                step = 1 if ia <= ib else -1
-                for v in range(ia, ib + step, step):
-                    out.append(str(v))
-            except Exception:
-                out.append(p)
-        else:
-            out.append(p)
-    return out
+# Backwards compatibility aliases - now using shared helpers
+_expand_csv_or_range = expand_csv_or_range
+_normalize_serial_port = normalize_serial_port
+_format_permutations = format_permutations_32
+_float_permutations_from_regs = float_permutations_from_regs
 
 
 import time
@@ -92,39 +68,6 @@ def _make_controller(uri: Optional[str] = None, db_path: Optional[str] = None) -
         return CoreController(uri=uri, db_path=db_path)
     return CoreController(transport=None)
 
-
-
-def _float_permutations_from_regs(regs: List[int]):
-    # regs expected length 2
-    b0 = bytes([(regs[0] >> 8) & 0xFF, regs[0] & 0xFF, (regs[1] >> 8) & 0xFF, regs[1] & 0xFF])
-    ABCD = from_bytes_to_float32(b0)
-    DCBA = from_bytes_to_float32(b0[::-1])
-    CDAB = from_bytes_to_float32(bytes([b0[2], b0[3], b0[0], b0[1]]))
-    BADC = from_bytes_to_float32(bytes([b0[1], b0[0], b0[3], b0[2]]))
-    return {"Big": ABCD, "Little": DCBA, "Mid-Big": CDAB, "Mid-Little": BADC}
-
-
-def _format_permutations(regs: List[int]):
-    """Return structured info for the four common 32-bit orderings.
-
-    Returns a dict mapping label -> dict with keys: `bytes`, `hex`, `uint32`, `float`.
-    """
-    b0 = bytes([(regs[0] >> 8) & 0xFF, regs[0] & 0xFF, (regs[1] >> 8) & 0xFF, regs[1] & 0xFF])
-    perms = {
-        "Big": b0,
-        "Little": b0[::-1],
-        "Mid-Big": bytes([b0[2], b0[3], b0[0], b0[1]]),
-        "Mid-Little": bytes([b0[1], b0[0], b0[3], b0[2]]),
-    }
-    out = {}
-    for k, bv in perms.items():
-        try:
-            f = from_bytes_to_float32(bv)
-        except Exception:
-            f = None
-        u = int.from_bytes(bv, byteorder='big', signed=False)
-        out[k] = {"bytes": bv, "hex": bv.hex().upper(), "uint32": u, "float": f}
-    return out
 
 
 def _describe_modbus_error(rr) -> str:

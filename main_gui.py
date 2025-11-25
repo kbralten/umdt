@@ -40,6 +40,9 @@ from serial.tools import list_ports
 from urllib.parse import urlparse, parse_qs
 from umdt.utils.ieee754 import from_bytes_to_float16
 from umdt.utils.modbus_compat import call_read_method, call_write_method
+from umdt.utils.parsing import expand_csv_or_range
+from umdt.utils.decoding import decode_registers, decode_to_table_dict
+from umdt.utils.encoding import encode_value, EncodingError
 import logging
 import inspect
 
@@ -1288,30 +1291,6 @@ class MainWindow(QMainWindow):
         self.btn_scan_clear.clicked.connect(self.on_scan_clear_clicked)
 
 
-    def _expand_csv_or_range(self, s: str) -> List[str]:
-        """Expand CSV/range strings like '1,2,5-8' into a list of strings."""
-        out: List[str] = []
-        if not s:
-            return out
-        for part in str(s).split(','):
-            p = part.strip()
-            if not p:
-                continue
-            if '-' in p and p.count('-') == 1:
-                a, b = p.split('-', 1)
-                try:
-                    ia = int(a, 0)
-                    ib = int(b, 0)
-                    step = 1 if ia <= ib else -1
-                    for v in range(ia, ib + step, step):
-                        out.append(str(v))
-                except Exception:
-                    out.append(p)
-            else:
-                out.append(p)
-        return out
-
-
     def _build_probe_tab(self) -> None:
         """Build the Probe tab UI and wire controls."""
         layout = QVBoxLayout()
@@ -1438,11 +1417,11 @@ class MainWindow(QMainWindow):
             return
 
         # Build parameter lists
-        hosts = self._expand_csv_or_range(self.probe_hosts_edit.text()) or []
-        ports = self._expand_csv_or_range(self.probe_ports_edit.text()) or []
-        serials = self._expand_csv_or_range(self.probe_serials_edit.text()) or []
-        bauds = self._expand_csv_or_range(self.probe_bauds_edit.text()) or []
-        units = self._expand_csv_or_range(self.probe_units_edit.text()) or ["1"]
+        hosts = expand_csv_or_range(self.probe_hosts_edit.text()) or []
+        ports = expand_csv_or_range(self.probe_ports_edit.text()) or []
+        serials = expand_csv_or_range(self.probe_serials_edit.text()) or []
+        bauds = expand_csv_or_range(self.probe_bauds_edit.text()) or []
+        units = expand_csv_or_range(self.probe_units_edit.text()) or ["1"]
 
         # Compute Cartesian product size for safety
         h = max(1, len(hosts))
@@ -2104,98 +2083,16 @@ class MainWindow(QMainWindow):
         """Return a list of decoding dicts for each endianness.
 
         Each dict contains keys: Format, Hex(s), UInt16, Int16, Float16, Hex32, Int32, Float32
+
+        Uses the shared decoding module for consistent behavior with CLI.
         """
-        import struct
+        if not regs:
+            return []
 
-        def decode_16(r, byteorder):
-            b = r.to_bytes(2, byteorder='big')
-            bb = b if byteorder == 'big' else b[::-1]
-            hexs = bb.hex().upper()
-            u = int.from_bytes(bb, byteorder='big', signed=False)
-            s = u if u < 0x8000 else u - 0x10000
-            try:
-                f16 = from_bytes_to_float16(bb)
-            except Exception:
-                f16 = None
-            return hexs, u, s, f16
-
-        def decode_32(a, b, order):
-            bv = a.to_bytes(2, byteorder='big') + b.to_bytes(2, byteorder='big')
-            if order == 'big':
-                raw = bv
-            elif order == 'little':
-                raw = bv[::-1]
-            elif order == 'mid-big':
-                raw = bytes([bv[2], bv[3], bv[0], bv[1]])
-            else:
-                raw = bytes([bv[1], bv[0], bv[3], bv[2]])
-            hex32 = raw.hex().upper()
-            try:
-                i32 = int.from_bytes(raw, byteorder='big', signed=True)
-            except Exception:
-                i32 = None
-            try:
-                u32 = int.from_bytes(raw, byteorder='big', signed=False)
-            except Exception:
-                u32 = None
-            try:
-                f32 = struct.unpack('!f', raw)[0]
-            except Exception:
-                f32 = None
-            return hex32, u32, i32, f32
-
-        rows = []
-        # For single 16-bit registers only show Big/Little. For 32-bit (pairs) show all four permutations.
-        if len(regs) >= 2:
-            orders = [('Big', 'big'), ('Little', 'little'), ('Mid-Big', 'mid-big'), ('Mid-Little', 'mid-little')]
-        else:
-            orders = [('Big', 'big'), ('Little', 'little')]
-        for label, order in orders:
-            if not regs:
-                rows.append({
-                    'Format': label,
-                    'Hex': '',
-                    'UInt16': '',
-                    'Int16': '',
-                    'Float16': '',
-                    'Hex32': '',
-                    'UInt32': '',
-                    'Int32': '',
-                    'Float32': '',
-                })
-                continue
-
-            # For simplicity show first register details and optional first pair 32-bit
-            first = regs[0]
-            hexs, u, s, f16 = decode_16(first, order)
-            hex_s_display = hexs
-            hex32_str = ''
-            u32_str = ''
-            i32_str = ''
-            f32_str = ''
-            if len(regs) >= 2:
-                hex32, u32_val, i32_val, f32_val = decode_32(regs[0], regs[1], order)
-                hex32_str = hex32 or ''
-                u32_str = '' if u32_val is None else str(u32_val)
-                i32_str = '' if i32_val is None else str(i32_val)
-                if f32_val is None:
-                    f32_str = ''
-                else:
-                    f32_str = f"{f32_val:.6g}" if isinstance(f32_val, (int, float)) else str(f32_val)
-
-            rows.append({
-                'Format': label,
-                'Hex': hex_s_display,
-                'UInt16': str(u),
-                'Int16': str(s),
-                'Float16': '' if f16 is None else (f"{f16:.6g}" if isinstance(f16, (int, float)) else str(f16)),
-                'Hex32': hex32_str,
-                'UInt32': u32_str,
-                'Int32': i32_str,
-                'Float32': f32_str,
-            })
-
-        return rows
+        # Use shared decoding helper
+        is_32bit = len(regs) >= 2
+        result = decode_registers(regs, long_mode=is_32bit, include_all_formats=True)
+        return decode_to_table_dict(result)
 
     def on_read_selection_changed(self, selected=None, deselected=None):
         try:
