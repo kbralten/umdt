@@ -39,7 +39,21 @@ from umdt.core.prober import Prober, TargetSpec
 from serial.tools import list_ports
 from urllib.parse import urlparse, parse_qs
 from umdt.utils.ieee754 import from_bytes_to_float16
-from umdt.utils.modbus_compat import call_read_method, call_write_method
+from umdt.utils.modbus_compat import (
+    call_read_method,
+    call_write_method,
+    create_client,
+    close_client,
+    read_holding_registers,
+    read_input_registers,
+    read_coils,
+    read_discrete_inputs,
+    write_registers,
+    write_register,
+    write_coil,
+    write_coils,
+    invoke_method,
+)
 from umdt.utils.parsing import expand_csv_or_range
 from umdt.utils.decoding import decode_registers, decode_to_table_dict
 from umdt.utils.encoding import encode_value, EncodingError
@@ -382,50 +396,55 @@ def run_gui_read(
     """
 
     from urllib.parse import urlparse, parse_qs
-    try:
-        from pymodbus.client import ModbusTcpClient, ModbusSerialClient
-    except Exception:
-        from pymodbus.client.sync import ModbusTcpClient, ModbusSerialClient  # type: ignore
 
     parsed = urlparse(uri)
     scheme = parsed.scheme or "serial"
     qs = parse_qs(parsed.query or "")
 
     # Parse connection details
-    if scheme == "serial":
-        netloc = parsed.netloc or parsed.path.lstrip("/")
-        if ":" in netloc:
-            port, baud_s = netloc.split(":", 1)
-            try:
-                baud = int(baud_s)
-            except Exception:
-                baud = int(qs.get("baud", ["9600"])[0])
-        else:
-            port = netloc or qs.get("port", [""])[0]
-            baud = int(qs.get("baud", ["9600"])[0])
-        try:
-            client = ModbusSerialClient(port=port, baudrate=baud)
-        except Exception as e:
-            raise RuntimeError(f"Failed to create serial client for {port}: {e}")
-    else:
-        host = parsed.hostname or "127.0.0.1"
-        tcp_port = parsed.port or int(qs.get("port", ["502"])[0])
-        try:
-            client = ModbusTcpClient(host, port=tcp_port)
-        except Exception as e:
-            raise RuntimeError(f"Failed to create TCP client for {host}:{tcp_port}: {e}")
-
-    # Connect to device
+    client = None
     try:
-        connected = client.connect()
-    except Exception as e:
-        raise RuntimeError(f"Connection error: {e}")
-    
-    if not connected:
         if scheme == "serial":
-            raise RuntimeError(f"Failed to connect to serial port {port} at {baud} baud. Check port name and permissions.")
+            netloc = parsed.netloc or parsed.path.lstrip("/")
+            if ":" in netloc:
+                port, baud_s = netloc.split(":", 1)
+                try:
+                    baud = int(baud_s)
+                except Exception:
+                    baud = int(qs.get("baud", ["9600"])[0])
+            else:
+                port = netloc or qs.get("port", [""])[0]
+                baud = int(qs.get("baud", ["9600"])[0])
+            try:
+                client = create_client(kind="serial", serial_port=port, baudrate=baud)
+            except Exception as e:
+                raise RuntimeError(f"Failed to create serial client for {port}: {e}")
         else:
-            raise RuntimeError(f"Failed to connect to {host}:{tcp_port}. Check host/port and network connectivity.")
+            host = parsed.hostname or "127.0.0.1"
+            tcp_port = parsed.port or int(qs.get("port", ["502"])[0])
+            try:
+                client = create_client(kind="tcp", host=host, port=tcp_port)
+            except Exception as e:
+                raise RuntimeError(f"Failed to create TCP client for {host}:{tcp_port}: {e}")
+
+        # Connect to device
+        try:
+            connected = client.connect()
+        except Exception as e:
+            raise RuntimeError(f"Connection error: {e}")
+        
+        if not connected:
+            if scheme == "serial":
+                raise RuntimeError(f"Failed to connect to serial port {port} at {baud} baud. Check port name and permissions.")
+            else:
+                raise RuntimeError(f"Failed to connect to {host}:{tcp_port}. Check host/port and network connectivity.")
+    except Exception:
+        # Ensure any partially-created client is closed
+        try:
+            close_client(client)
+        except Exception:
+            pass
+        raise
 
     props = DATA_TYPE_PROPERTIES[data_type]
     if not props.readable or not props.pymodbus_read_method:
@@ -438,15 +457,29 @@ def run_gui_read(
     else:
         total_count = max(1, value_count)
 
-    # Perform read
+    # Perform read using compat wrappers
     try:
-        response = call_read_method(client, props.pymodbus_read_method, address, total_count, unit)
+        _read_map = {
+            'read_holding_registers': read_holding_registers,
+            'read_input_registers': read_input_registers,
+            'read_coils': read_coils,
+            'read_discrete_inputs': read_discrete_inputs,
+        }
+        reader = _read_map.get(props.pymodbus_read_method)
+        if reader:
+            response = reader(client, address, total_count, unit)
+        else:
+            # Fall back to compatibility helper invocation if mapping missing
+            response = invoke_method(client, props.pymodbus_read_method, address, total_count, unit)
     except Exception as e:
-        client.close()
+        try:
+            close_client(client)
+        except Exception:
+            pass
         raise RuntimeError(f"Modbus read error: {e}")
     finally:
         try:
-            client.close()
+            close_client(client)
         except Exception:
             pass
 
@@ -594,48 +627,6 @@ def run_gui_write(
     import math
     import struct
     from urllib.parse import urlparse, parse_qs
-    try:
-        from pymodbus.client import ModbusTcpClient, ModbusSerialClient
-    except Exception:
-        from pymodbus.client.sync import ModbusTcpClient, ModbusSerialClient  # type: ignore
-
-    def _write_registers_compat(client, address: int, regs, unit: int):
-        fn = getattr(client, 'write_registers')
-        try:
-            sig = inspect.signature(fn)
-            params = list(sig.parameters.keys())
-        except Exception:
-            params = []
-        try:
-            if 'unit' in params:
-                return fn(address, regs, unit=unit)
-            if 'slave' in params:
-                return fn(address, regs, slave=unit)
-        except TypeError:
-            pass
-        try:
-            return fn(address, regs)
-        except Exception:
-            return fn(address, regs, unit)
-
-    def _write_register_compat(client, address: int, val, unit: int):
-        fn = getattr(client, 'write_register')
-        try:
-            sig = inspect.signature(fn)
-            params = list(sig.parameters.keys())
-        except Exception:
-            params = []
-        try:
-            if 'unit' in params:
-                return fn(address, val, unit=unit)
-            if 'slave' in params:
-                return fn(address, val, slave=unit)
-        except TypeError:
-            pass
-        try:
-            return fn(address, val)
-        except Exception:
-            return fn(address, val, unit)
 
     # Parse and validate value
     is_hex = value_text.strip().lower().startswith("0x")
@@ -756,43 +747,50 @@ def run_gui_write(
     scheme = parsed.scheme or "serial"
     qs = parse_qs(parsed.query or "")
 
-    # Create client
-    if scheme == "serial":
-        netloc = parsed.netloc or parsed.path.lstrip("/")
-        if ":" in netloc:
-            port, baud_s = netloc.split(":", 1)
-            try:
-                baud = int(baud_s)
-            except Exception:
-                baud = int(qs.get("baud", ["9600"])[0])
-        else:
-            port = netloc or qs.get("port", [""])[0]
-            baud = int(qs.get("baud", ["9600"])[0])
-        try:
-            client = ModbusSerialClient(port=port, baudrate=baud)
-        except Exception as e:
-            raise RuntimeError(f"Failed to create serial client for {port}: {e}")
-    else:
-        host = parsed.hostname or "127.0.0.1"
-        tcp_port = parsed.port or int(qs.get("port", ["502"])[0])
-        try:
-            client = ModbusTcpClient(host, port=tcp_port)
-        except Exception as e:
-            raise RuntimeError(f"Failed to create TCP client for {host}:{tcp_port}: {e}")
-
-    # Connect
+    client = None
     try:
-        connected = client.connect()
-    except Exception as e:
-        raise RuntimeError(f"Connection error: {e}")
-    
-    if not connected:
         if scheme == "serial":
-            raise RuntimeError(f"Failed to connect to serial port {port} at {baud} baud. Check port name and permissions.")
+            netloc = parsed.netloc or parsed.path.lstrip("/")
+            if ":" in netloc:
+                port, baud_s = netloc.split(":", 1)
+                try:
+                    baud = int(baud_s)
+                except Exception:
+                    baud = int(qs.get("baud", ["9600"])[0])
+            else:
+                port = netloc or qs.get("port", [""])[0]
+                baud = int(qs.get("baud", ["9600"])[0])
+            try:
+                client = create_client(kind="serial", serial_port=port, baudrate=baud)
+            except Exception as e:
+                raise RuntimeError(f"Failed to create serial client for {port}: {e}")
         else:
-            raise RuntimeError(f"Failed to connect to {host}:{tcp_port}. Check host/port and network connectivity.")
+            host = parsed.hostname or "127.0.0.1"
+            tcp_port = parsed.port or int(qs.get("port", ["502"])[0])
+            try:
+                client = create_client(kind="tcp", host=host, port=tcp_port)
+            except Exception as e:
+                raise RuntimeError(f"Failed to create TCP client for {host}:{tcp_port}: {e}")
 
-    # Perform write using data type specific method
+        # Connect
+        try:
+            connected = client.connect()
+        except Exception as e:
+            raise RuntimeError(f"Connection error: {e}")
+        
+        if not connected:
+            if scheme == "serial":
+                raise RuntimeError(f"Failed to connect to serial port {port} at {baud} baud. Check port name and permissions.")
+            else:
+                raise RuntimeError(f"Failed to connect to {host}:{tcp_port}. Check host/port and network connectivity.")
+    except Exception:
+        try:
+            close_client(client)
+        except Exception:
+            pass
+        raise
+
+    # Perform write using compat wrappers
     try:
         # For coils, convert register values to boolean list
         if data_type == DataType.COIL:
@@ -806,19 +804,24 @@ def run_gui_write(
                     bit_values.append(bool((reg >> bit_pos) & 1))
             # If single bit, use write_coil, else write_coils
             if len(bit_values) == 1:
-                res = call_write_method(client, 'write_coil', address, bit_values[0], unit)
+                res = write_coil(client, address, bit_values[0], unit)
             else:
-                res = call_write_method(client, 'write_coils', address, bit_values, unit)
+                res = write_coils(client, address, bit_values, unit)
         else:
             # For registers, use appropriate write method
             if long_mode or (float_mode and len(regs) == 2) or len(regs) > 1:
-                res = call_write_method(client, props.pymodbus_write_method, address, regs, unit)
+                res = write_registers(client, address, regs, unit)
             else:
                 # Single register write
                 if props.pymodbus_write_method == 'write_registers':
-                    res = call_write_method(client, 'write_register', address, regs[0], unit)
+                    res = write_register(client, address, regs[0], unit)
                 else:
-                    res = call_write_method(client, props.pymodbus_write_method, address, regs, unit)
+                    # Try mapping common names, otherwise call attribute directly
+                    if props.pymodbus_write_method == 'write_register':
+                        res = write_register(client, address, regs[0], unit)
+                    else:
+                        # Use compatibility helper for non-standard write method names
+                        res = invoke_method(client, props.pymodbus_write_method, address, regs, unit)
         
         # Check for protocol errors
         if hasattr(res, "isError") and res.isError():
@@ -842,10 +845,14 @@ def run_gui_write(
     except RuntimeError:
         raise
     except Exception as e:
+        try:
+            close_client(client)
+        except Exception:
+            pass
         raise RuntimeError(f"Modbus write error: {e}")
     finally:
         try:
-            client.close()
+            close_client(client)
         except Exception:
             pass
 
