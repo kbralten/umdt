@@ -2,13 +2,15 @@
 
 ## **Executive Summary**
 
-The **Universal Modbus Diagnostic Tool (UMDT)** is a unified Python-based toolkit designed to bridge the gap between ad-hoc scripting and rigid proprietary software in industrial automation. Unlike traditional tools that focus solely on "happy path" communication, UMDT is architected as a comprehensive **Diagnostic Suite** comprising two distinct but complementary engines: an **Active Client** for inspecting and controlling field devices, and a **Mock Server** for simulation, regression testing, and fault injection.
+The **Universal Modbus Diagnostic Tool (UMDT)** is a unified Python-based toolkit designed to bridge the gap between ad-hoc scripting and rigid proprietary software in industrial automation. Unlike traditional tools that focus solely on "happy path" communication, UMDT is architected as a comprehensive **Active Client** for inspecting, controlling, and discovering field devices in production environments.
 
-The system leverages a "write once, interface anywhere" philosophy, utilizing a shared asynchronous (asyncio) backend to drive both a robust Command Line Interface (CLI) for headless automation and a rich PySide6 Graphical User Interface (GUI) for interactive analysis. This dual-engine approach allows engineers to validate control logic against a "perfect" or "faulty" mock device before deploying to the field, and subsequently use the same toolchain to commission and troubleshoot the physical hardware.
+The system leverages a "write once, interface anywhere" philosophy, utilizing a shared asynchronous (asyncio) backend to drive both a robust Command Line Interface (CLI) for headless automation and a rich PySide6 Graphical User Interface (GUI) for interactive analysis. This architecture allows engineers to commission and troubleshoot physical hardware using the same core engine whether at a terminal or in a graphical environment.
 
-## **1\. System Architecture: The Dual-Core Engine**
+> **Note:** UMDT also includes a separate Mock Server component for simulation and testing. See `dev_docs/mock/architecture.md` for details on the Mock Server architecture.
 
-The UMDT architecture is divided into two primary operational cores that share a common foundation of libraries and utilities. This separation ensures that the tool can act as a lightweight client or a heavy-duty simulator without unnecessary overhead.
+## **1. System Architecture**
+
+UMDT is built on a foundation of shared infrastructure components that enable both CLI and GUI interfaces to access the same diagnostic capabilities without code duplication.
 
 ### **1.1 The Shared Foundation**
 
@@ -85,75 +87,32 @@ While scan discovers data on a known connection, the Prober discovers the connec
 
 Output: A list of "Alive" endpoints, allowing the user to immediately transition to scan or monitor mode on the discovered settings.
 
-## **3\. The Mock Server Module**
+## **3. Frontend Implementation**
 
-The Mock Server acts as a "Digital Twin" for development. It decouples the testing process from physical hardware availability.
+The UMDT Active Client provides two distinct entry points, catering to different workflows.
 
-### **3.1 Configuration-Driven Architecture**
+### **3.1 Command Line Interface (CLI)**
 
-The server state is defined by YAML/JSON configuration files. These files describe:
-
-* **Register Groups:** Logical blocks of memory (e.g., "Motor Control", "Temperature Sensors").  
-* **Initial Values:** Startup states for registers.  
-* **Transport Settings:** TCP Port or Serial Port parameters.
-
-### **3.2 Dynamic Runtime Control**
-
-Unlike static simulators, the UMDT Mock Server exposes a runtime API via CLI REPL and GUI Control Panel.
-
-* **Interactive REPL:** A command loop allowing users to set values, toggle rules, or inject faults while the server is running.  
-* **Diagnostics Stream:** A live feed of events (Read, Write, Error) broadcast to the frontend for analysis.
-
-### **3.3 Fault Injection System**
-
-To validate the robustness of Master/Client applications, the Mock Server can inject errors:
-
-* **Latency:** Artificial delays to test timeout logic.  
-* **Packet Drop:** Simulating unreliable networks.  
-* **Bit Flips:** Simulating electrical noise.  
-* **Exceptions:** Forcing Modbus Exceptions (e.g., 0x02 Illegal Data Address) on specific registers.
-
-## **4\. Frontend Implementation**
-
-The UMDT provides four distinct entry points, catering to different workflows.
-
-### **4.1 Command Line Interfaces (CLI)**
-
-**main\_cli.py (Client CLI)**
+**main\_cli.py**
 
 * **Library:** Typer  
 * **Philosophy:** Opinionated, stateless commands.  
 * **Wizards:** If connection arguments (--port, \--baud) are omitted, a wizard prompts the user, reducing friction.  
-* **Commands:** read, write, scan, monitor, decode.
+* **Commands:** read, write, scan, probe, monitor, decode.
 
-**mock\_server\_cli.py (Server CLI)**
+### **3.2 Graphical User Interface (GUI)**
 
-* **Library:** Typer \+ Custom REPL loop.  
-* **Philosophy:** Stateful session management.  
-* **Capabilities:** Load configs, manage groups, and modify server state in real-time.
-
-### **4.2 Graphical User Interfaces (GUI)**
-
-**main\_gui.py (Client GUI)**
+**main\_gui.py**
 
 * **Library:** PySide6 \+ qasync.  
-* **Design:** Tabbed interface (Interact, Monitor, Scan).  
+* **Design:** Tabbed interface (Interact, Monitor, Scan, Probe).  
 * **Interact Tab:** Single-shot operations with detailed "Per-Endian" decoding panels.  
 * **Monitor Tab:** Scrolling history of polled values with error highlighting.  
 * **Scan Tab:** Grid view of discovered registers with real-time progress tracking.  
+* **Probe Tab:** Connection discovery with combinatorial parameter search and results table.
 * **Connectivity:** Connection panel persists across tabs, managing the CoreController.
 
-**mock\_server\_gui.py (Server GUI)**
-
-* **Library:** PySide6 \+ qasync.  
-* **Design:** Control Panel Dashboard.  
-* **Features:**  
-  * **Group Table:** Sortable view of loaded register groups.  
-  * **Fault Sliders:** Visual controls to adjust latency and drop rates.  
-  * **Event Log:** Live stream of incoming requests and server responses.  
-  * **Value Editor:** Manual override widgets for simulation values.
-
-## **5\. Technical Stack & Dependencies**
+## **4. Technical Stack & Dependencies**
 
 | Component | Library | Purpose |
 | :---- | :---- | :---- |
@@ -166,14 +125,14 @@ The UMDT provides four distinct entry points, catering to different workflows.
 | **CLI Formatting** | Rich | Colored tables, logs, and progress bars |
 | **Serial I/O** | pyserial | Hardware access for RTU |
 
-## **6\. Development Workflow**
+## **5. Development Workflow**
 
-The project is structured to allow independent evolution of the Client and Server modules while sharing core utilities.
+The project is structured to support rapid development and testing:
 
-* **Entry Points:** Explicit separation of main\_cli.py, main\_gui.py, mock\_server\_cli.py, and mock\_server\_gui.py ensures clear boundaries of concern.  
-* **Configuration:** The use of standard JSON/YAML for server profiles ensures portability and version control of test scenarios.  
-* **Testing:** pytest is used for unit testing core logic (decoders, frame builders), while the Mock Server itself serves as the integration test target for the Client.
+* **Entry Points:** Clear separation of main\_cli.py and main\_gui.py ensures focused functionality.  
+* **Testing:** pytest is used for unit testing core logic (decoders, frame builders, transport layers).  
+* **Integration Testing:** The separate Mock Server (see `dev_docs/mock/architecture.md`) serves as an integration test target.
 
-## **7\. Conclusion**
+## **6. Conclusion**
 
-The implemented architecture of the UMDT successfully realizes the vision of a "Full Stack" diagnostic tool. By moving beyond simple sniffing and implementing a robust Active Client alongside a capable Mock Server, the tool empowers developers and engineers to own the entire communication loop—from generating the signal to simulating the response—within a single, unified Python ecosystem.
+The implemented architecture of the UMDT Active Client successfully delivers a robust diagnostic tool for field work. By providing both CLI and GUI interfaces backed by a common asyncio engine, the tool empowers engineers to discover, read, write, monitor, and probe Modbus devices efficiently in production environments.
