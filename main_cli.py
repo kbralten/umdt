@@ -7,7 +7,12 @@ from umdt.commands.builder import CommandBuilder
 from umdt.utils.ieee754 import from_bytes_to_float32, from_bytes_to_float16
 from umdt.utils.parsing import expand_csv_or_range, normalize_serial_port
 from umdt.utils.address import parse_address, format_address
-from umdt.utils.decoding import format_permutations_32, float_permutations_from_regs
+from umdt.utils.decoding import (
+    format_permutations_32,
+    float_permutations_from_regs,
+    decode_registers,
+    decode_to_table_dict,
+)
 from urllib.parse import urlparse, parse_qs
 from umdt.core.data_types import (
     DATA_TYPE_PROPERTIES,
@@ -209,28 +214,27 @@ def _present_registers(start_addr: int, regs: List[int], e_norm: str, address_wa
     If `e_norm` == 'all' this prints Big/Little rows for the single register.
     Otherwise prints each register with the selected endian interpretation and a Float16 column.
     """
+    # Use shared decoding helpers to produce a consistent table representation
+    # If requesting 'all' formats, show Big/Little rows for the single register
+    if not regs:
+        console.print("No registers to display")
+        return
+
     if e_norm == 'all':
+        result = decode_registers(regs, long_mode=False, include_all_formats=True)
+        rows = decode_to_table_dict(result)
         table = Table(show_header=True, header_style="bold magenta")
         table.add_column("Format")
         table.add_column("Hex")
         table.add_column("UInt16")
         table.add_column("Int16")
         table.add_column("Float16")
-        # only one register expected when 'all' used
-        r = int(regs[0])
-        b = bytes([(r >> 8) & 0xFF, r & 0xFF])
-        for label, bv in (('Big', b), ('Little', b[::-1])):
-            uintv = int.from_bytes(bv, byteorder='big', signed=False)
-            intv = uintv if uintv < 0x8000 else uintv - 0x10000
-            try:
-                fval = from_bytes_to_float16(bv)
-            except Exception:
-                fval = None
-            hexv = bv.hex().upper()
-            table.add_row(label, hexv, str(uintv), str(intv), str(fval))
+        for r in rows:
+            table.add_row(r['Format'], r['Hex'], r['UInt16'], r['Int16'], r['Float16'])
         console.print(table)
         return
 
+    # Single-format view for each register
     fmt = 'big' if e_norm in ('big', 'mid-big') else 'little'
     table = Table(show_header=True, header_style="bold magenta")
     table.add_column("Index")
@@ -238,21 +242,17 @@ def _present_registers(start_addr: int, regs: List[int], e_norm: str, address_wa
     table.add_column("UInt16")
     table.add_column("Int16")
     table.add_column("Float16")
+    # Use decode_registers for the selected format per register
     for i, r in enumerate(regs):
-        rr_val = int(r)
-        b = bytes([(rr_val >> 8) & 0xFF, rr_val & 0xFF])
-        if fmt == 'little':
-            b = b[::-1]
-        uintv = int.from_bytes(b, byteorder='big', signed=False)
-        intv = uintv if uintv < 0x8000 else uintv - 0x10000
-        try:
-            fval = from_bytes_to_float16(b)
-        except Exception:
-            fval = None
-        hexv = '0x' + b.hex().upper()
+        decoded = decode_registers([int(r)], long_mode=False, include_all_formats=False)
+        row = decode_to_table_dict(decoded)[0]
+        hexv = row.get('Hex', '')
+        uintv = row.get('UInt16', '')
+        intv = row.get('Int16', '')
+        fval = row.get('Float16', '')
         idx = start_addr + i
         idx_disp = hex(idx) if address_was_hex else str(idx)
-        table.add_row(idx_disp, hexv, str(uintv), str(intv), str(fval))
+        table.add_row(idx_disp, hexv, uintv, intv, fval)
     console.print(table)
 
 

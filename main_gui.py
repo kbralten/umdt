@@ -54,6 +54,7 @@ from umdt.utils.modbus_compat import (
     write_coils,
     invoke_method,
 )
+from umdt.utils.decoding import decode_registers, decode_to_table_dict
 import logging
 import inspect
 
@@ -81,7 +82,7 @@ class ReadRow:
 class MonitorSample:
     """A single monitor poll sample (one interval)."""
     timestamp: str
-    raw_values: List[Union[int, bool]]
+    raw_registers: List[Union[int, bool]]
     address_start: int
     unit_id: int
     data_type: DataType
@@ -153,15 +154,15 @@ class MonitorModel(QAbstractTableModel):
 
             # Columns 1+: register values with selected decoding
             reg_idx = col - 1
-            if reg_idx >= len(sample.raw_values):
+            if reg_idx >= len(sample.raw_registers):
                 return ""
 
             # Decode value based on datatype/decoding mode
             if is_bit_type(sample.data_type):
-                bit_val = bool(sample.raw_values[reg_idx])
+                bit_val = bool(sample.raw_registers[reg_idx])
                 return "ON" if bit_val else "OFF"
 
-            reg_val = int(sample.raw_values[reg_idx])
+            reg_val = int(sample.raw_registers[reg_idx])
 
             if self._decoding == "Hex":
                 return f"0x{reg_val:04X}"
@@ -2090,10 +2091,9 @@ class MainWindow(QMainWindow):
 
         Uses the shared decoding module for consistent behavior with CLI.
         """
+        # Delegate to shared decoding helpers
         if not regs:
             return []
-
-        # Use shared decoding helper
         is_32bit = len(regs) >= 2
         result = decode_registers(regs, long_mode=is_32bit, include_all_formats=True)
         return decode_to_table_dict(result)
@@ -2153,35 +2153,34 @@ class MainWindow(QMainWindow):
             # For 32-bit longs we hide the 16-bit columns (1-4) and show 32-bit columns (5-8).
             is_32 = len(regs) >= 2
             if is_32:
-                # hide 16-bit columns
+                # Hide 16-bit columns and show 32-bit columns
                 table.setColumnHidden(1, True)
                 table.setColumnHidden(2, True)
                 table.setColumnHidden(3, True)
                 table.setColumnHidden(4, True)
-                # show 32-bit columns
                 table.setColumnHidden(5, False)
                 table.setColumnHidden(6, False)
                 table.setColumnHidden(7, False)
                 table.setColumnHidden(8, False)
             else:
-                # show 16-bit columns
+                # Show 16-bit columns and hide 32-bit columns
                 table.setColumnHidden(1, False)
                 table.setColumnHidden(2, False)
                 table.setColumnHidden(3, False)
                 table.setColumnHidden(4, False)
-                # hide 32-bit columns
                 table.setColumnHidden(5, True)
                 table.setColumnHidden(6, True)
                 table.setColumnHidden(7, True)
                 table.setColumnHidden(8, True)
+
+            # Populate rows from decoding_rows
             table.setRowCount(len(decoding_rows))
             for r_idx, d in enumerate(decoding_rows):
-                table.setItem(r_idx, 0, QTableWidgetItem(d['Format']))
+                table.setItem(r_idx, 0, QTableWidgetItem(d.get('Format', '')))
                 table.setItem(r_idx, 1, QTableWidgetItem(d.get('Hex', '')))
                 table.setItem(r_idx, 2, QTableWidgetItem(d.get('UInt16', '')))
                 table.setItem(r_idx, 3, QTableWidgetItem(d.get('Int16', '')))
                 table.setItem(r_idx, 4, QTableWidgetItem(d.get('Float16', '')))
-                # 32-bit columns (may be empty for single-register reads)
                 table.setItem(r_idx, 5, QTableWidgetItem(d.get('Hex32', '')))
                 table.setItem(r_idx, 6, QTableWidgetItem(d.get('UInt32', '')))
                 table.setItem(r_idx, 7, QTableWidgetItem(d.get('Int32', '')))
@@ -2270,7 +2269,8 @@ class MainWindow(QMainWindow):
         regs_to_read = count * 2 if long_mode else count
 
         # Configure the model with register count for column headers
-        self.monitor_model.set_config(regs_to_read, long_mode, e_norm)
+        data_type = self._current_data_type()
+        self.monitor_model.set_config(regs_to_read, long_mode, e_norm, data_type)
 
         # Update UI state
         self.btn_monitor_start.setEnabled(False)
@@ -2279,7 +2279,7 @@ class MainWindow(QMainWindow):
 
         # Start the polling task
         self._monitor_task = asyncio.create_task(
-            self._monitor_polling_loop(addr, count, regs_to_read, long_mode, e_norm, unit, interval_sec)
+            self._monitor_polling_loop(addr, count, regs_to_read, long_mode, e_norm, unit, interval_sec, data_type)
         )
 
     @qasync.asyncSlot()
@@ -2304,7 +2304,7 @@ class MainWindow(QMainWindow):
         self.monitor_model.clear_samples()
         self.monitor_status_label.setText("Cleared")
 
-    async def _monitor_polling_loop(self, addr: int, count: int, regs_to_read: int, long_mode: bool, endian: str, unit: int, interval_sec: float):
+    async def _monitor_polling_loop(self, addr: int, count: int, regs_to_read: int, long_mode: bool, endian: str, unit: int, interval_sec: float, data_type: DataType):
         """Async polling loop that reads from the device at configured interval."""
         poll_count = 0
         while True:
@@ -2320,7 +2320,7 @@ class MainWindow(QMainWindow):
                         long_mode,
                         endian,
                         False,
-                        DataType.HOLDING,
+                        data_type,
                         unit,
                         self._connection_uri,
                     )
@@ -2332,6 +2332,7 @@ class MainWindow(QMainWindow):
                         raw_registers=list(regs),
                         address_start=addr,
                         unit_id=unit,
+                        data_type=data_type,
                     )
                     self.monitor_model.add_sample(sample)
 
@@ -2357,6 +2358,7 @@ class MainWindow(QMainWindow):
                         raw_registers=[],
                         address_start=addr,
                         unit_id=unit,
+                        data_type=data_type,
                         error=str(exc),
                     )
                     self.monitor_model.add_sample(error_sample)
@@ -2368,6 +2370,7 @@ class MainWindow(QMainWindow):
                         raw_registers=[],
                         address_start=addr,
                         unit_id=unit,
+                        data_type=data_type,
                         error=f"Unexpected error: {exc}",
                     )
                     self.monitor_model.add_sample(error_sample)
