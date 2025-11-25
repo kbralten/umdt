@@ -73,6 +73,18 @@ The scanner is designed to map the memory map of unknown devices.
 * **Type Agnostic:** Can scan Holding Registers, Input Registers, Coils, or Discrete Inputs.  
 * **Fault Tolerance:** Silently ignores "Illegal Data Address" exceptions, logging only successful reads to produce a clean map of available points.
 
+### **2.4 The Connection Prober (probe)**
+
+While scan discovers data on a known connection, the Prober discovers the connection itself. This is critical for recovering "lost" devices where the baud rate, slave ID, or IP address is unknown.
+
+ * **Combinatorial Search:** The Prober accepts lists of parameters and iterates through the Cartesian product of all combinations.
+ * **TCP Mode:** [192.168.1.10, 192.168.1.11] × [502, 5020] × Unit IDs [1, 255]
+ * **Serial Mode:** [COM3, COM4] × [9600, 19200, 115200] × Unit IDs [1-10]
+ * **Fast-Fail Transport:** Unlike standard connections which may wait 3s for a timeout, the Prober utilizes a "Hyper-Aggressive" transport configuration (e.g., 100ms timeout) to churn through thousands of combinations quickly.
+ * **Success Condition:** The user configures a "Target Register" (e.g., Holding Register 40001). A combination is deemed "Found" if, and only if, a valid Modbus response (Exception or Data) is received for that target.
+
+Output: A list of "Alive" endpoints, allowing the user to immediately transition to scan or monitor mode on the discovered settings.
+
 ## **3\. The Mock Server Module**
 
 The Mock Server acts as a "Digital Twin" for development. It decouples the testing process from physical hardware availability.

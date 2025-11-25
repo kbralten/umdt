@@ -35,6 +35,7 @@ from umdt.core.data_types import (
     is_bit_type,
     is_register_type,
 )
+from umdt.core.prober import Prober, TargetSpec
 from serial.tools import list_ports
 from urllib.parse import urlparse, parse_qs
 from umdt.utils.ieee754 import from_bytes_to_float16
@@ -953,6 +954,8 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.interact_tab, "Interact")
         self.tabs.addTab(self.monitor_tab, "Monitor")
         self.tabs.addTab(self.scan_tab, "Scan")
+        self.probe_tab = QWidget()
+        self.tabs.addTab(self.probe_tab, "Probe")
 
         # Build Interact tab layout (Read / Write panels)
         self._build_interact_tab()
@@ -962,6 +965,8 @@ class MainWindow(QMainWindow):
 
         # Build Scan tab layout
         self._build_scan_tab()
+        # Build Probe tab layout
+        self._build_probe_tab()
 
         root_layout.addWidget(self.tabs)
 
@@ -1281,6 +1286,316 @@ class MainWindow(QMainWindow):
         self.btn_scan_start.clicked.connect(self.on_scan_start_clicked)
         self.btn_scan_stop.clicked.connect(self.on_scan_stop_clicked)
         self.btn_scan_clear.clicked.connect(self.on_scan_clear_clicked)
+
+
+    def _expand_csv_or_range(self, s: str) -> List[str]:
+        """Expand CSV/range strings like '1,2,5-8' into a list of strings."""
+        out: List[str] = []
+        if not s:
+            return out
+        for part in str(s).split(','):
+            p = part.strip()
+            if not p:
+                continue
+            if '-' in p and p.count('-') == 1:
+                a, b = p.split('-', 1)
+                try:
+                    ia = int(a, 0)
+                    ib = int(b, 0)
+                    step = 1 if ia <= ib else -1
+                    for v in range(ia, ib + step, step):
+                        out.append(str(v))
+                except Exception:
+                    out.append(p)
+            else:
+                out.append(p)
+        return out
+
+
+    def _build_probe_tab(self) -> None:
+        """Build the Probe tab UI and wire controls."""
+        layout = QVBoxLayout()
+
+        # --- Parameter inputs row ---
+        params_row = QHBoxLayout()
+        self.probe_hosts_edit = QLineEdit()
+        self.probe_hosts_edit.setPlaceholderText("Hosts (CSV or ranges)")
+        self.probe_ports_edit = QLineEdit()
+        self.probe_ports_edit.setPlaceholderText("Ports (CSV)")
+        self.probe_serials_edit = QLineEdit()
+        self.probe_serials_edit.setPlaceholderText("Serial ports (CSV)")
+        self.probe_bauds_edit = QLineEdit()
+        self.probe_bauds_edit.setPlaceholderText("Bauds (CSV)")
+        self.probe_units_edit = QLineEdit("1")
+        self.probe_units_edit.setMaximumWidth(120)
+
+        params_row.addWidget(QLabel("Hosts:"))
+        params_row.addWidget(self.probe_hosts_edit)
+        params_row.addWidget(QLabel("Ports:"))
+        params_row.addWidget(self.probe_ports_edit)
+        params_row.addWidget(QLabel("Serials:"))
+        params_row.addWidget(self.probe_serials_edit)
+        params_row.addWidget(QLabel("Bauds:"))
+        params_row.addWidget(self.probe_bauds_edit)
+        params_row.addWidget(QLabel("Units:"))
+        params_row.addWidget(self.probe_units_edit)
+
+        layout.addLayout(params_row)
+
+        # --- Target register / datatype row ---
+        target_row = QHBoxLayout()
+        self.probe_addr_edit = QLineEdit("1")
+        self.probe_addr_edit.setMaximumWidth(150)
+        self.probe_datatype_combo = QComboBox()
+        for dtype in (DataType.HOLDING, DataType.INPUT, DataType.COIL, DataType.DISCRETE):
+            props = DATA_TYPE_PROPERTIES[dtype]
+            self.probe_datatype_combo.addItem(props.label)
+        self.probe_target_label = QLabel("Target address and type")
+        target_row.addWidget(QLabel("Address:"))
+        target_row.addWidget(self.probe_addr_edit)
+        target_row.addWidget(QLabel("Type:"))
+        target_row.addWidget(self.probe_datatype_combo)
+        target_row.addStretch()
+        layout.addLayout(target_row)
+
+        # --- Probe config row ---
+        config_row = QHBoxLayout()
+        self.probe_timeout_spin = QSpinBox()
+        self.probe_timeout_spin.setRange(10, 10000)
+        self.probe_timeout_spin.setValue(100)
+        self.probe_timeout_spin.setSuffix(" ms")
+        self.probe_concurrency_spin = QSpinBox()
+        self.probe_concurrency_spin.setRange(1, 1024)
+        self.probe_concurrency_spin.setValue(64)
+        self.probe_attempts_spin = QSpinBox()
+        self.probe_attempts_spin.setRange(1, 10)
+        self.probe_attempts_spin.setValue(1)
+        self.probe_backoff_spin = QSpinBox()
+        self.probe_backoff_spin.setRange(0, 10000)
+        self.probe_backoff_spin.setValue(0)
+
+        config_row.addWidget(QLabel("Timeout:"))
+        config_row.addWidget(self.probe_timeout_spin)
+        config_row.addWidget(QLabel("Concurrency:"))
+        config_row.addWidget(self.probe_concurrency_spin)
+        config_row.addWidget(QLabel("Attempts:"))
+        config_row.addWidget(self.probe_attempts_spin)
+        config_row.addWidget(QLabel("Backoff:"))
+        config_row.addWidget(self.probe_backoff_spin)
+        config_row.addStretch()
+        layout.addLayout(config_row)
+
+        # --- Controls ---
+        controls_row = QHBoxLayout()
+        self.btn_probe_start = QPushButton("Start")
+        self.btn_probe_stop = QPushButton("Stop")
+        self.btn_probe_stop.setEnabled(False)
+        self.btn_probe_clear = QPushButton("Clear")
+        self.btn_probe_export = QPushButton("Export JSON")
+        controls_row.addWidget(self.btn_probe_start)
+        controls_row.addWidget(self.btn_probe_stop)
+        controls_row.addWidget(self.btn_probe_clear)
+        controls_row.addWidget(self.btn_probe_export)
+        controls_row.addStretch()
+        layout.addLayout(controls_row)
+
+        # --- Progress / summary ---
+        self.probe_status_label = QLabel("Idle")
+        layout.addWidget(self.probe_status_label)
+
+        # --- Results table ---
+        self.probe_table = QTableWidget()
+        self.probe_table.setColumnCount(5)
+        self.probe_table.setHorizontalHeaderLabels(["URI", "Params", "Status", "Summary", "RTT (ms)"])
+        self.probe_table.verticalHeader().setVisible(False)
+        header = self.probe_table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.Stretch)
+        layout.addWidget(self.probe_table)
+
+        self.probe_tab.setLayout(layout)
+
+        # Internal state
+        self._probe_task: Optional[asyncio.Task] = None
+        self._probe_cancel_event: Optional[asyncio.Event] = None
+        self._probe_results: List[dict] = []
+
+        # Wire buttons
+        self.btn_probe_start.clicked.connect(self.on_probe_start_clicked)
+        self.btn_probe_stop.clicked.connect(self.on_probe_stop_clicked)
+        self.btn_probe_clear.clicked.connect(self.on_probe_clear_clicked)
+        self.btn_probe_export.clicked.connect(self.on_probe_export_clicked)
+
+
+    @qasync.asyncSlot()
+    async def on_probe_start_clicked(self):
+        # Require the app to be disconnected so Prober can open short-lived clients
+        if self._connection_uri is not None:
+            QMessageBox.warning(self, "Disconnect first", "Please disconnect (click Disconnect) before probing so the Prober can open its own short-lived clients.")
+            return
+
+        if self._probe_task is not None and not self._probe_task.done():
+            QMessageBox.information(self, "Probe running", "A probe run is already in progress.")
+            return
+
+        # Build parameter lists
+        hosts = self._expand_csv_or_range(self.probe_hosts_edit.text()) or []
+        ports = self._expand_csv_or_range(self.probe_ports_edit.text()) or []
+        serials = self._expand_csv_or_range(self.probe_serials_edit.text()) or []
+        bauds = self._expand_csv_or_range(self.probe_bauds_edit.text()) or []
+        units = self._expand_csv_or_range(self.probe_units_edit.text()) or ["1"]
+
+        # Compute Cartesian product size for safety
+        h = max(1, len(hosts))
+        p = max(1, len(ports))
+        s = max(1, len(serials))
+        u = max(1, len(units))
+        total = (h * p + s * len(bauds or [9600])) * u
+        if total > 5000:
+            res = QMessageBox.question(self, "Large probe", f"Probe will test ~{total} combinations. Continue?", QMessageBox.Yes | QMessageBox.No)
+            if res != QMessageBox.Yes:
+                return
+
+        # Prepare combinations list
+        combinations = []
+        # Add TCP combos
+        if hosts and ports:
+            for hh in hosts:
+                for pp in ports:
+                    for uu in units:
+                        try:
+                            combinations.append({"host": hh, "port": int(pp, 0), "unit": int(uu, 0)})
+                        except Exception:
+                            combinations.append({"host": hh, "port": pp, "unit": int(uu) if uu.isdigit() else 1})
+        elif hosts:
+            for hh in hosts:
+                for uu in units:
+                    try:
+                        combinations.append({"host": hh, "port": int(self.tcp_port_edit.text() or 502), "unit": int(uu, 0)})
+                    except Exception:
+                        combinations.append({"host": hh, "port": int(self.tcp_port_edit.text() or 502), "unit": int(uu) if uu.isdigit() else 1})
+
+        # Add serial combos
+        if serials:
+            for dev in serials:
+                for bd in (bauds or [self.baud_edit.text() or "115200"]):
+                    for uu in units:
+                        try:
+                            combinations.append({"serial": dev, "baud": int(bd, 0), "unit": int(uu, 0)})
+                        except Exception:
+                            combinations.append({"serial": dev, "baud": bd, "unit": int(uu) if uu.isdigit() else 1})
+
+        # If no explicit combos built, fallback to the built URI from top-bar inputs
+        if not combinations:
+            combinations = [self.build_uri()]
+
+        # Setup Prober
+        timeout_ms = int(self.probe_timeout_spin.value())
+        concurrency = int(self.probe_concurrency_spin.value())
+        attempts = int(self.probe_attempts_spin.value())
+        backoff_ms = int(self.probe_backoff_spin.value())
+        datatype = self._datatype_map.get(self.probe_datatype_combo.currentIndex(), DataType.HOLDING)
+        try:
+            addr = int(self.probe_addr_edit.text().strip(), 0)
+        except Exception:
+            QMessageBox.warning(self, "Invalid address", "Enter a valid decimal or 0xHEX address.")
+            return
+
+        target = TargetSpec(datatype=datatype, address=addr)
+
+        prober = Prober(timeout_ms=timeout_ms, concurrency=concurrency, attempts=attempts, backoff_ms=backoff_ms)
+
+        # Clear previous results
+        self.probe_table.setRowCount(0)
+        self._probe_results = []
+
+        # Create cancel event
+        self._probe_cancel_event = asyncio.Event()
+
+        def _on_result(pr):
+            # Called in the same event loop; safe to update UI
+            # Track all results (for accurate count), but only show ALIVE in table
+            self._probe_results.append({"uri": pr.uri, "alive": pr.alive, "summary": pr.response_summary, "elapsed_ms": pr.elapsed_ms})
+            if pr.alive:
+                row = self.probe_table.rowCount()
+                self.probe_table.insertRow(row)
+                self.probe_table.setItem(row, 0, QTableWidgetItem(pr.uri))
+                self.probe_table.setItem(row, 1, QTableWidgetItem(str(pr.params)))
+                self.probe_table.setItem(row, 2, QTableWidgetItem("ALIVE"))
+                self.probe_table.setItem(row, 3, QTableWidgetItem(str(pr.response_summary)))
+                self.probe_table.setItem(row, 4, QTableWidgetItem(f"{pr.elapsed_ms:.1f}"))
+            self.probe_status_label.setText(f"Tested {len(self._probe_results)} / {len(combinations)} — found {sum(1 for r in self._probe_results if r['alive'])}")
+
+        # Disable writes during probing
+        try:
+            self.btn_write.setEnabled(False)
+        except Exception:
+            pass
+
+        # Start probe task
+        self.btn_probe_start.setEnabled(False)
+        self.btn_probe_stop.setEnabled(True)
+        self.probe_status_label.setText(f"Probing {len(combinations)} targets...")
+
+        async def _run():
+            try:
+                await prober.run(combinations, target, on_result=_on_result, cancel_token=self._probe_cancel_event)
+                alive_count = sum(1 for r in self._probe_results if r['alive'])
+                self.probe_status_label.setText(f"Probe complete — tested {len(self._probe_results)}/{len(combinations)}, found {alive_count}")
+            except asyncio.CancelledError:
+                self.probe_status_label.setText(f"Probe cancelled — tested {len(self._probe_results)}/{len(combinations)}")
+            except Exception as e:
+                self.probe_status_label.setText(f"Probe error: {e}")
+                QMessageBox.critical(self, "Probe Error", f"An error occurred during probe: {e}")
+            finally:
+                self.btn_probe_start.setEnabled(True)
+                self.btn_probe_stop.setEnabled(False)
+                try:
+                    self.btn_write.setEnabled(True)
+                except Exception:
+                    pass
+
+        self._probe_task = asyncio.create_task(_run())
+
+    @qasync.asyncSlot()
+    async def on_probe_stop_clicked(self):
+        if self._probe_task is None or self._probe_task.done():
+            return
+        if self._probe_cancel_event:
+            self._probe_cancel_event.set()
+        self._probe_task.cancel()
+        try:
+            await self._probe_task
+        except asyncio.CancelledError:
+            pass
+        self.probe_status_label.setText("Probe stopped")
+        self.btn_probe_start.setEnabled(True)
+        self.btn_probe_stop.setEnabled(False)
+        try:
+            self.btn_write.setEnabled(True)
+        except Exception:
+            pass
+
+    def on_probe_clear_clicked(self):
+        self.probe_table.setRowCount(0)
+        self._probe_results = []
+        self.probe_status_label.setText("Idle")
+
+    def on_probe_export_clicked(self):
+        # Simple file chooser using Qt
+        from PySide6.QtWidgets import QFileDialog
+        if not self._probe_results:
+            QMessageBox.information(self, "No results", "No probe results to export.")
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Save probe results", "probe_results.json", "JSON Files (*.json);;All Files (*)")
+        if not path:
+            return
+        try:
+            import json
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(self._probe_results, fh, indent=2)
+            QMessageBox.information(self, "Saved", f"Wrote {len(self._probe_results)} results to {path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Export failed", f"Failed to write results: {e}")
 
     def build_uri(self) -> str:
         """Build a connection URI from the connection panel fields.

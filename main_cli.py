@@ -30,7 +30,36 @@ def _normalize_serial_port(s: str) -> str:
     return s.lstrip("/")
 
 
+def _expand_csv_or_range(s: Optional[str]) -> List[str]:
+    """Expand a CSV string and simple ranges (e.g. '1-5') into a list of strings.
+
+    Returns an empty list for None/empty input.
+    """
+    if not s:
+        return []
+    out: List[str] = []
+    for part in str(s).split(','):
+        p = part.strip()
+        if not p:
+            continue
+        if '-' in p and p.count('-') == 1:
+            a, b = p.split('-', 1)
+            try:
+                ia = int(a, 0)
+                ib = int(b, 0)
+                step = 1 if ia <= ib else -1
+                for v in range(ia, ib + step, step):
+                    out.append(str(v))
+            except Exception:
+                out.append(p)
+        else:
+            out.append(p)
+    return out
+
+
 import time
+import itertools
+import json
 
 _HAS_PYMODBUS = True
 ModbusTcpClient = None
@@ -52,6 +81,7 @@ from rich.console import Console
 from rich.table import Table
 
 from umdt.modbus_exceptions import get_modbus_exception_text
+from umdt.core.prober import Prober, TargetSpec
 
 app = typer.Typer()
 console = Console()
@@ -1057,6 +1087,163 @@ def write(
         client.close()
 
 
+
+
+@app.command()
+def probe(
+    hosts: Optional[str] = typer.Option(None, help="Comma-separated hosts or range (e.g. '192.168.1.1-10')"),
+    ports: Optional[str] = typer.Option(None, help="Comma-separated ports or range (e.g. '502,503' or '500-510')"),
+    serials: Optional[str] = typer.Option(None, help="Comma-separated serial ports (e.g. 'COM5,COM6')"),
+    bauds: Optional[str] = typer.Option(None, help="Comma-separated baud rates or range (e.g. '9600,115200')"),
+    units: str = typer.Option("1", help="Comma-separated unit IDs or range (e.g. '1-5')"),
+    address: str = typer.Option("0", help="Target register address (decimal or 0xHEX)"),
+    datatype: str = typer.Option("holding", "--datatype", "-d", help="Data type: holding|input|coil|discrete"),
+    timeout: int = typer.Option(100, help="Timeout in milliseconds per probe"),
+    concurrency: int = typer.Option(32, help="Maximum concurrent probes"),
+    attempts: int = typer.Option(1, help="Number of attempts per probe"),
+    backoff: int = typer.Option(0, help="Backoff in milliseconds between attempts"),
+    output: Optional[str] = typer.Option(None, "--output", "-o", help="Output results to JSON file"),
+    alive_only: bool = typer.Option(False, "--alive-only", help="Only show alive results"),
+):
+    """Probe Modbus endpoints to discover working connections.
+
+    Tests combinations of connection parameters (TCP hosts/ports or serial ports/bauds)
+    against a target register to identify responding devices.
+
+    Examples:
+      - Probe TCP ports: `umdt probe --hosts 127.0.0.1 --ports 500-550`
+      - Probe serial: `umdt probe --serials COM5,COM6 --bauds 9600,115200`
+      - Combined: `umdt probe --hosts 192.168.1.10 --ports 502 --units 1-10`
+    """
+    if not _HAS_PYMODBUS:
+        console.print("pymodbus is required for probing")
+        raise typer.Exit(code=1)
+
+    # Build combinations
+    combinations = []
+    
+    # Expand parameters
+    host_list = _expand_csv_or_range(hosts) if hosts else []
+    port_list = _expand_csv_or_range(ports) if ports else []
+    serial_list = _expand_csv_or_range(serials) if serials else []
+    baud_list = _expand_csv_or_range(bauds) if bauds else []
+    unit_list = _expand_csv_or_range(units) if units else ["1"]
+    
+    # Build TCP combinations
+    if host_list and port_list:
+        for h in host_list:
+            for p in port_list:
+                for u in unit_list:
+                    try:
+                        combinations.append({"host": h, "port": int(p, 0), "unit": int(u, 0)})
+                    except Exception:
+                        console.print(f"[yellow]Warning: skipping invalid TCP combo {h}:{p} unit {u}[/yellow]")
+    
+    # Build serial combinations
+    if serial_list:
+        if not baud_list:
+            baud_list = ["9600"]
+        for dev in serial_list:
+            for bd in baud_list:
+                for u in unit_list:
+                    try:
+                        combinations.append({"serial": dev, "baud": int(bd, 0), "unit": int(u, 0)})
+                    except Exception:
+                        console.print(f"[yellow]Warning: skipping invalid serial combo {dev}@{bd} unit {u}[/yellow]")
+    
+    if not combinations:
+        console.print("[red]No valid combinations to probe. Specify --hosts/--ports or --serials/--bauds.[/red]")
+        raise typer.Exit(code=1)
+    
+    # Parse target address and datatype
+    try:
+        numeric_address = int(address, 0)
+    except Exception:
+        console.print("[red]Invalid address format[/red]")
+        raise typer.Exit(code=1)
+    
+    try:
+        data_type = parse_data_type(datatype)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1)
+    
+    target = TargetSpec(datatype=data_type, address=numeric_address)
+    
+    # Create prober
+    prober = Prober(
+        timeout_ms=timeout,
+        concurrency=concurrency,
+        attempts=attempts,
+        backoff_ms=backoff
+    )
+    
+    console.print(f"Probing {len(combinations)} combination(s)...")
+    console.print(f"  Target: {data_type.value} register at address {address}")
+    console.print(f"  Timeout: {timeout}ms, Concurrency: {concurrency}, Attempts: {attempts}")
+    
+    # Run probe
+    results = []
+    
+    def on_result(pr):
+        results.append(pr)
+        # Live feedback for alive results only
+        if pr.alive:
+            if not alive_only:
+                console.print(f"[green]✓[/green] {pr.uri} - {pr.response_summary} ({pr.elapsed_ms:.1f}ms)")
+            else:
+                console.print(f"[green]✓[/green] {pr.uri}")
+    
+    async def run_probe():
+        return await prober.run(combinations, target, on_result=on_result)
+    
+    try:
+        asyncio.run(run_probe())
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Probe cancelled[/yellow]")
+        raise typer.Exit(code=1)
+    
+    # Summary
+    alive_count = sum(1 for r in results if r.alive)
+    console.print(f"\nProbe complete:")
+    console.print(f"  Tested: {len(results)} / {len(combinations)}")
+    console.print(f"  Alive: {alive_count}")
+    console.print(f"  Dead: {len(results) - alive_count}")
+    
+    # Display results table (alive results only)
+    if alive_count > 0:
+        table = Table(show_header=True, header_style="bold magenta")
+        table.add_column("URI")
+        table.add_column("Summary")
+        table.add_column("Time (ms)")
+        
+        for pr in results:
+            if pr.alive:
+                table.add_row(pr.uri, pr.response_summary or "", f"{pr.elapsed_ms:.1f}")
+        
+        console.print(table)
+    elif len(results) > 0:
+        console.print("[yellow]No alive results found[/yellow]")
+    
+    # Export to JSON if requested
+    if output:
+        import json
+        try:
+            export_data = [
+                {
+                    "uri": pr.uri,
+                    "params": pr.params,
+                    "alive": pr.alive,
+                    "response_summary": pr.response_summary,
+                    "elapsed_ms": pr.elapsed_ms
+                }
+                for pr in results
+            ]
+            with open(output, 'w') as f:
+                json.dump(export_data, f, indent=2)
+            console.print(f"[green]Results exported to {output}[/green]")
+        except Exception as e:
+            console.print(f"[red]Failed to export results: {e}[/red]")
 
 
 if __name__ == "__main__":
