@@ -54,9 +54,6 @@ from umdt.utils.modbus_compat import (
     write_coils,
     invoke_method,
 )
-from umdt.utils.parsing import expand_csv_or_range
-from umdt.utils.decoding import decode_registers, decode_to_table_dict
-from umdt.utils.encoding import encode_value, EncodingError
 import logging
 import inspect
 
