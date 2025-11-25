@@ -156,6 +156,9 @@ class TestNormalizeSerialPort:
     def test_empty_string(self):
         assert normalize_serial_port("") == ""
 
-    def test_linux_paths(self):
-        # Linux paths lose first slash but that's intentional for urlparse results
+    def test_linux_paths_note(self):
+        # Note: This function removes leading slashes, so Linux paths
+        # that start with / will lose that slash. This is intentional
+        # for handling URL-parsed Windows COM ports. For Linux paths,
+        # callers should typically not use this function.
         assert normalize_serial_port("/dev/ttyUSB0") == "dev/ttyUSB0"

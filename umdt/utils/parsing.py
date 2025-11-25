@@ -127,20 +127,25 @@ def parse_serial_baud(s: str, default_baud: int = 9600) -> tuple:
 
 
 def normalize_serial_port(s: str) -> str:
-    """Normalize a serial port name.
+    """Normalize a serial port name from URL parsing.
 
-    Removes leading slashes that may appear from URL parsing.
+    This function is specifically designed to handle serial port names that
+    come from URL parsing (e.g., urlparse), where Windows COM ports get a
+    leading slash (e.g., '/COM3').
 
-    Examples:
-        "/COM3" -> "COM3"
-        "COM5" -> "COM5"
-        "/dev/ttyUSB0" -> "dev/ttyUSB0" (Linux paths preserved after first /)
+    Note: Linux device paths like '/dev/ttyUSB0' will have the leading slash
+    removed, resulting in 'dev/ttyUSB0'. For Linux paths, this function is
+    typically not needed as the full path should be preserved.
 
     Args:
-        s: Serial port string
+        s: Serial port string (may have leading slashes from URL parsing)
 
     Returns:
-        Normalized port name
+        Port name with leading slashes removed
+
+    Examples:
+        normalize_serial_port("/COM3") -> "COM3"
+        normalize_serial_port("COM5") -> "COM5"
     """
     if not s:
         return s

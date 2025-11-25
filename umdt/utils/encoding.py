@@ -23,7 +23,8 @@ def encode_int16(
 
     Args:
         value: Integer value to encode
-        signed: If True, interpret as signed (-32768 to 32767)
+        signed: If True, interpret as signed (-32768 to 32767).
+                Note: Negative values automatically enable signed mode.
         endian: Byte order - "big" or "little"
 
     Returns:
@@ -32,7 +33,7 @@ def encode_int16(
     Raises:
         EncodingError: If value is out of range
     """
-    # Determine if we need to treat as signed based on value
+    # Auto-detect signed mode for negative values
     if value < 0:
         signed = True
     
@@ -67,7 +68,8 @@ def encode_int32(
 
     Args:
         value: Integer value to encode
-        signed: If True, interpret as signed (-2147483648 to 2147483647)
+        signed: If True, interpret as signed (-2147483648 to 2147483647).
+                Note: Negative values automatically enable signed mode.
         endian: Byte/word order - "big", "little", "mid-big", "mid-little"
 
     Returns:
@@ -76,7 +78,7 @@ def encode_int32(
     Raises:
         EncodingError: If value is out of range
     """
-    # Determine if we need to treat as signed based on value
+    # Auto-detect signed mode for negative values
     if value < 0:
         signed = True
     
