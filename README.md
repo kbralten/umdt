@@ -85,6 +85,50 @@ A transparent bridge for routing Modbus traffic between different transports (e.
   ```
 - `info`: Show bridge status and capabilities.
 
+### PCAP Logging (Forensic Capture)
+The bridge can capture all Modbus traffic to a PCAP file for analysis in Wireshark or similar tools.
+```bash
+# Capture traffic while bridging
+python bridge.py start --upstream-port 5503 --downstream-host 127.0.0.1 --downstream-port 5502 --pcap capture.pcap
+```
+The PCAP uses `DLT_USER0` (147) linktype with a 4-byte metadata header indicating direction (inbound/outbound) and protocol (RTU/TCP). Open in Wireshark and use "Decode As" → "User DLT" to inspect frames.
+
+### Wireshark Lua plugin
+We provide two Lua scripts to make UMDT PCAPs decode nicely in Wireshark:
+
+- `umdt_modbus_wrapper.lua` — a wrapper that strips the 4-byte UMDT metadata header, converts Modbus-RTU frames to MBAP-like TVBs (removing CRC when present), sets `Src`/`Dst` to `client`/`server`, and populates the `Info` column with the Modbus Unit/Function summary.
+- `umdt_mbap.lua` — a simple MBAP dissector used by the wrapper to decode MBAP PDUs (function codes, byte counts, registers) and to detect Modbus exceptions. Exceptions are added as expert-error items so Wireshark highlights them.
+
+You may need to provide the full path instead of relative paths to the Lua scripts when using the `-X` option, remember to add `lua_script:` before the path.
+
+#### Quick usage (one-off, CLI):
+
+```powershell
+"C:\Program Files\Wireshark\tshark.exe" \
+  -X lua_script:umdt_modbus_wrapper.lua \
+  -X lua_script:umdt_mbap.lua \
+  -r capture.pcap -V
+```
+
+#### Quick usage (Wireshark GUI):
+
+- Start Wireshark with the two scripts loaded temporarily:
+
+```powershell
+"C:\Program Files\Wireshark\wireshark.exe" -X lua_script:umdt_modbus_wrapper.lua -X lua_script:umdt_mbap.lua
+```
+
+- Or install the scripts permanently by copying them to your personal Wireshark plugins directory:
+  - Windows (per-user): `%APPDATA%\Wireshark\plugins\`
+  - Windows (system): `C:\Program Files\Wireshark\plugins\`
+
+#### Notes
+- UMDT PCAP record format: first 4 bytes are metadata — byte 0 = direction (1=inbound, 2=outbound), byte 1 = protocol hint (1=MODBUS_RTU, 2=MODBUS_TCP), bytes 2-3 reserved.
+- The wrapper will automatically strip that metadata for decoding. For RTU frames it will attempt CRC detection and remove the CRC before wrapping into an MBAP-like TVB.
+- The `umdt_mbap.lua` dissector tags Modbus exception responses (function >= 0x80) and adds expert-error entries so they appear highlighted in Wireshark.
+- If you prefer to decode the PCAP manually, set "Decode As" → `USER0` (147) to `umdt_modbus` (or load the wrapper script) so Wireshark uses the wrapper for these records.
+
+
 ## Development Notes
 
 ### Setup

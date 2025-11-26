@@ -39,6 +39,7 @@ if __name__ == "__main__":
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from umdt.bridge import Bridge, FrameType
+from umdt.bridge.hooks.pcap_hook import PcapHook
 
 app = typer.Typer(
     name="bridge",
@@ -142,6 +143,12 @@ def start(
         "-v",
         help="Enable debug logging",
     ),
+    pcap: Optional[str] = typer.Option(
+        None,
+        "--pcap",
+        "-p",
+        help="Write traffic to PCAP file for Wireshark analysis",
+    ),
 ) -> None:
     """Start the Modbus bridge.
 
@@ -235,6 +242,14 @@ def start(
     bridge.pipeline.add_ingress_hook(log_request)
     bridge.pipeline.add_response_hook(log_response)
 
+    # Set up PCAP logging if requested
+    pcap_hook: Optional[PcapHook] = None
+    if pcap:
+        pcap_hook = PcapHook(pcap)
+        bridge.pipeline.add_ingress_hook(pcap_hook.ingress_hook)
+        bridge.pipeline.add_response_hook(pcap_hook.response_hook)
+        console.print(f"[cyan]PCAP logging enabled: {pcap}[/cyan]")
+
     # Run bridge
     console.print(Panel.fit("[bold green]Starting bridge...[/bold green]"))
 
@@ -256,6 +271,10 @@ def start(
             pass
 
         try:
+            # Start PCAP logging if configured
+            if pcap_hook:
+                await pcap_hook.start()
+
             await bridge.start()
             console.print("[bold green]Bridge running. Press Ctrl+C to stop.[/bold green]")
 
@@ -266,14 +285,20 @@ def start(
                 except asyncio.TimeoutError:
                     # Display stats periodically
                     stats = bridge.get_stats()
+                    pcap_info = ""
+                    if pcap_hook and pcap_hook.is_active:
+                        pcap_stats = pcap_hook.stats
+                        pcap_info = f", {pcap_stats['packets']} packets logged"
                     console.print(
                         f"[dim]Stats: {stats['requests_processed']} requests, "
-                        f"{stats['upstream_clients']} clients[/dim]"
+                        f"{stats['upstream_clients']} clients{pcap_info}[/dim]"
                     )
         except KeyboardInterrupt:
             console.print("\n[yellow]Interrupted[/yellow]")
         finally:
             await bridge.stop()
+            if pcap_hook:
+                await pcap_hook.stop()
             console.print("[green]Bridge stopped.[/green]")
 
     try:
