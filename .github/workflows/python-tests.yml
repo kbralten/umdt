@@ -38,3 +38,23 @@ jobs:
 
       - name: Run tests
         run: python -m pytest -q
+
+  e2e-docker:
+    name: E2E Docker Compose
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure script is executable
+        run: |
+          ls -la docker || true
+          chmod +x docker/run_e2e.sh || true
+
+      - name: Run Docker E2E script
+        env:
+          COMPOSE_HTTP_TIMEOUT: 200
+        run: |
+          set -e
+          # Run the project's E2E script which builds the images, starts the mock server, runs tests, and tears down
+          bash docker/run_e2e.sh

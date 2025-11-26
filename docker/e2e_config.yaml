@@ -1,0 +1,56 @@
+# E2E test configuration for mock Modbus server
+# Minimal config with predictable values for validation
+
+unit_id: 1
+
+groups:
+  - name: test_holdings
+    type: holding
+    start: 0
+    length: 20
+    writable: true
+
+  - name: test_inputs
+    type: input
+    start: 0
+    length: 10
+    writable: false
+
+  - name: test_coils
+    type: coil
+    start: 0
+    length: 16
+    writable: true
+
+  - name: test_discretes
+    type: discrete
+    start: 0
+    length: 16
+    writable: false
+
+# Freeze some registers at known values for validation
+rules:
+  # Holding register 0 frozen at 12345
+  "0":
+    mode: frozen-value
+    forced_value: 12345
+  # Holding register 1 frozen at 0xABCD (43981)
+  "1":
+    mode: frozen-value
+    forced_value: 43981
+
+scripts: []
+
+# No artificial latency or faults for E2E tests
+latency_ms: 0
+latency_jitter_pct: 0.0
+faults:
+  drop_rate_pct: 0.0
+  bit_flip_pct: 0.0
+
+transport:
+  tcp_host: 0.0.0.0
+  tcp_port: 5020
+
+logging:
+  level: INFO
