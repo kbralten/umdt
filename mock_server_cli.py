@@ -158,10 +158,12 @@ async def _interactive_console(device: MockDevice) -> None:
         console.print(f"Unknown command: {raw}")
 
 
-async def _run_server(config_path: Path, tcp_host: Optional[str], tcp_port: int, serial_port: Optional[str], serial_baud: int, interactive: bool) -> None:
+async def _run_server(config_path: Path, tcp_host: Optional[str], tcp_port: int, serial_port: Optional[str], serial_baud: int, interactive: bool, pcap_path: Optional[Path] = None) -> None:
     cfg = load_config(config_path)
     device = MockDevice(cfg)
-    coordinator = TransportCoordinator(device, unit_id=cfg.unit_id)
+    coordinator = TransportCoordinator(device, unit_id=cfg.unit_id, pcap_path=pcap_path)
+    if pcap_path:
+        console.print(f"[yellow]PCAP logging enabled: {pcap_path}[/]")
     async def _event_printer(dev: MockDevice) -> None:
         try:
             while True:
@@ -209,12 +211,13 @@ def start(
     serial_port: Optional[str] = typer.Option(None, help="Serial port device"),
     serial_baud: int = typer.Option(9600, help="Serial baudrate"),
     interactive: bool = typer.Option(False, help="Launch interactive console for runtime control"),
+    pcap: Optional[Path] = typer.Option(None, help="Path to PCAP file for traffic capture"),
 ):
     """Start the mock server over TCP or serial."""
 
     _ensure_transport_args(tcp_host, tcp_port, serial_port)
     try:
-        asyncio.run(_run_server(config, tcp_host, tcp_port, serial_port, serial_baud, interactive))
+        asyncio.run(_run_server(config, tcp_host, tcp_port, serial_port, serial_baud, interactive, pcap))
     except KeyboardInterrupt:
         console.print("Stopping server...")
 

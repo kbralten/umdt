@@ -163,6 +163,7 @@ class PcapWriter:
         )
         self._file.write(pkt_header)
         self._file.write(full_data[:captured_len])
+        self._file.flush()  # Ensure packet is written to disk immediately
 
         self._packet_count += 1
         self._bytes_written += 16 + captured_len
