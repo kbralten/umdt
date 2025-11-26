@@ -58,3 +58,68 @@ jobs:
           set -e
           # Run the project's E2E script which builds the images, starts the mock server, runs tests, and tears down
           bash docker/run_e2e.sh
+
+  ui-tests:
+    name: UI Tests with Mock Server
+    needs: e2e-docker
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install system dependencies for Qt
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxcb-xinerama0 \
+            libxkbcommon-x11-0 \
+            libxcb-icccm4 \
+            libxcb-image0 \
+            libxcb-keysyms1 \
+            libxcb-randr0 \
+            libxcb-render-util0 \
+            libxcb-shape0 \
+            libxcb-cursor0 \
+            libegl1 \
+            libgl1-mesa-glx \
+            xvfb
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install -r requirements-dev.txt
+
+      - name: Start mock server container
+        run: |
+          docker compose up -d mock-server
+          # Wait for mock server to be ready
+          for i in {1..30}; do
+            if docker compose exec -T mock-server python -c "import socket; s=socket.socket(); s.settimeout(1); s.connect(('localhost',5020)); s.close()" 2>/dev/null; then
+              echo "Mock server is ready!"
+              break
+            fi
+            echo "Waiting for mock server... ($i/30)"
+            sleep 1
+          done
+
+      - name: Run UI tests with xvfb
+        env:
+          DISPLAY: ":99"
+          QT_QPA_PLATFORM: "offscreen"
+          MOCK_SERVER_HOST: "localhost"
+          MOCK_SERVER_PORT: "5020"
+        run: |
+          # Start Xvfb
+          Xvfb :99 -screen 0 1024x768x24 &
+          sleep 2
+          # Run UI tests
+          python -m pytest tests/ui/ -v --tb=short || true
+
+      - name: Stop mock server
+        if: always()
+        run: docker compose down
