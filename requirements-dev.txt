@@ -1,5 +1,5 @@
 pyinstaller
 pytest
 pytest-asyncio
-pytest-qt
 # Add other development-only tools here, e.g. pytest, tox, pre-commit
+# pytest-qt is installed only for UI tests in the CI (it requires Qt libs)
