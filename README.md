@@ -2,165 +2,175 @@
 # Universal Modbus Diagnostic Tool (UMDT)
 
 ## Overview
-UMDT is a Python-based toolkit for diagnosing and exercising Modbus devices (RTU/TCP).
-It provides a small, opinionated CLI used for interactive and scripted testing plus helpers
-for decoding register values locally.
+UMDT is a comprehensive Python-based toolkit for diagnosing, simulating, and bridging Modbus devices (RTU/TCP).
+It has evolved into three distinct tools:
+1. **Interactive Tool**: A CLI and GUI for reading/writing registers, scanning addresses, and probing networks.
+2. **Mock Server**: A configurable simulation environment for creating virtual Modbus devices with fault injection.
+3. **Bridge**: A soft-gateway for routing Modbus traffic between TCP and Serial (RTU) networks.
 
-This README documents the current CLI surface and runtime behavior implemented in
-`main_cli.py`.
+## 1. Interactive Tool (CLI & GUI)
+The interactive tool is designed for direct communication with Modbus devices.
 
-## Quick Setup
-- Install runtime dependencies in your development environment:
+### CLI (`main_cli.py`)
+The CLI provides a suite of commands for quick diagnostics and scripting.
 
+**Common Options:**
+- Connection: `--serial COMx --baud 9600` or `--host x.x.x.x --port 502`
+- Addressing: `--unit 1 --address 0x10`
+- Data: `--count 5`, `--long` (32-bit), `--float`, `--endian big|little`
+
+**Commands:**
+- `read`: Read registers (holding/input/coil/discrete).
+  ```bash
+  python main_cli.py read --host 192.168.1.10 --address 0 --count 10
+  ```
+- `write`: Write values to registers.
+  ```bash
+  python main_cli.py write --serial COM3 --address 0 1234
+  python main_cli.py write --host 127.0.0.1 --address 10 --float 12.5
+  ```
+- `monitor`: Poll a device repeatedly (like `read` but continuous).
+- `scan`: Discover readable registers in an address range.
+  ```bash
+  python main_cli.py scan 0 100 --host 192.168.1.10
+  ```
+- `probe`: Find devices by testing combinations of connection parameters (baud rates, Unit IDs, etc.).
+  ```bash
+  python main_cli.py probe --serials COM3 --bauds 9600,115200 --units 1-10
+  ```
+- `decode`: Offline decoder for hex values (no device required).
+  ```bash
+  python main_cli.py decode 0x4120 0x0000
+  ```
+- `ports`: List available serial ports.
+
+### GUI (`main_gui.py`)
+A PySide6-based desktop application that mirrors the CLI functionality with a visual interface.
+- **Interact**: Single-shot read/write with detailed decoding (Hex, Int, Float).
+- **Monitor**: Continuous polling with history and error highlighting.
+- **Scan**: Visual address scanner with real-time results.
+- **Probe**: Network discovery tool with exportable results.
+
+Launch with: `python main_gui.py`
+
+## 2. Mock Server (Simulation)
+A configurable Modbus slave for development, testing, and demos. It supports fault injection (latency, errors) and complex register mapping.
+
+### CLI (`mock_server_cli.py`)
+- `start`: Launch the server.
+  ```bash
+  python mock_server_cli.py start --config configs/pump.json --tcp-port 5502 --interactive
+  ```
+- `groups`: Manage register groups.
+- `values`: Set static values or rules (e.g., freeze value, error on write).
+- `faults`: Inject network faults (latency, packet drops).
+
+### GUI (`mock_server_gui.py`)
+A control panel for the mock server to visualize state, modify values on-the-fly, and control fault injection sliders.
+
+### Configuration
+Configs are YAML/JSON files defining register maps and initial state. See `server.md` for details.
+
+## 3. Bridge (Soft-Gateway)
+A transparent bridge for routing Modbus traffic between different transports (e.g., TCP Master to RTU Slave). It supports protocol conversion and multiple concurrent upstream clients.
+
+### CLI (`bridge.py`)
+- `start`: Start the bridge.
+  ```bash
+  # TCP Master -> RTU Slave (SCADA -> RS-485)
+  python bridge.py start --upstream-port 502 --downstream-serial COM3 --downstream-baud 9600
+
+  # TCP Master -> TCP Slave (Port Forwarding/Inspection)
+  python bridge.py start --upstream-port 5503 --downstream-host 127.0.0.1 --downstream-port 5502
+  ```
+- `info`: Show bridge status and capabilities.
+
+### PCAP Logging (Forensic Capture)
+The bridge can capture all Modbus traffic to a PCAP file for analysis in Wireshark or similar tools.
 ```bash
-pip install -r requirements.txt
+# Capture traffic while bridging
+python bridge.py start --upstream-port 5503 --downstream-host 127.0.0.1 --downstream-port 5502 --pcap capture.pcap
+```
+The PCAP uses `DLT_USER0` (147) linktype with a 4-byte metadata header indicating direction (inbound/outbound) and protocol (RTU/TCP). Open in Wireshark and use "Decode As" → "User DLT" to inspect frames.
+
+### Wireshark Lua plugin
+We provide two Lua scripts to make UMDT PCAPs decode nicely in Wireshark:
+
+- `umdt_modbus_wrapper.lua` — a wrapper that strips the 4-byte UMDT metadata header, converts Modbus-RTU frames to MBAP-like TVBs (removing CRC when present), sets `Src`/`Dst` to `client`/`server`, and populates the `Info` column with the Modbus Unit/Function summary.
+- `umdt_mbap.lua` — a simple MBAP dissector used by the wrapper to decode MBAP PDUs (function codes, byte counts, registers) and to detect Modbus exceptions. Exceptions are added as expert-error items so Wireshark highlights them.
+
+You may need to provide the full path instead of relative paths to the Lua scripts when using the `-X` option, remember to add `lua_script:` before the path.
+
+#### Quick usage (one-off, CLI):
+
+```powershell
+"C:\Program Files\Wireshark\tshark.exe" \
+  -X lua_script:umdt_modbus_wrapper.lua \
+  -X lua_script:umdt_mbap.lua \
+  -r capture.pcap -V
 ```
 
-## CLI Commands (current)
-- `read` — Read registers from a device (online only).
-    - Requires `--serial/--baud` or `--host/--port` (if omitted, a small wizard prompts for connection details).
-    - Requires `--address` (decimal or `0xHEX`); `--count` selects number of values; `--long` reads 2 registers per value.
-    - `--endian` supports `big|little|mid-big|mid-little` (or `b|l|mb|ml`); `--endian all` shows multiple permutations (only valid for single-value reads).
-    - Enforces the Modbus request limit of 125 registers per request.
+#### Quick usage (Wireshark GUI):
 
-- `monitor` — Poll a device repeatedly using the same options as `read` (wizard prompts if connection missing).
+- Start Wireshark with the two scripts loaded temporarily:
 
-- `decode` — Local offline decoder for one or two 16-bit registers.
-    - Usage examples:
-        - Single register (16-bit) decode: `python main_cli.py decode 0x4120`
-        - Pair (32-bit) decode: `python main_cli.py decode 0x4120 0x0000`
-    - Shows tables for Big/Little (16-bit) or Big/Little/Mid-* (32-bit) permutations and prints Hex/UInt/Int/Float interpretations.
-
-- `scan` — Scan a range of Modbus addresses to discover readable registers.
-    - Requires `--serial/--baud` or `--host/--port` (connection method is required; wizard is not available).
-    - Accepts start and end addresses as positional arguments (decimal or `0xHEX`): e.g., `scan 0 100` or `scan 0x0000 0x00FF`.
-    - `--datatype` (or `-d`) selects which register type to scan: `holding|input|coil|discrete` (default: `holding`).
-    - Attempts to read each address in the range as a single register/coil. Only prints addresses that return successful reads; errors are silently ignored.
-    - Output format matches input: if either address is specified in hex, results are printed in hex; otherwise decimal.
-    - Shows live progress as addresses are found and prints a summary count when complete.
-    - Usage examples:
-        - `python main_cli.py scan 0 100 --host 192.168.1.10` — scan holding registers 0-100 via TCP
-        - `python main_cli.py scan 0x0000 0x00FF --serial COM5 --datatype coil` — scan coils 0-255 via serial
-
-- `probe` — Discover working Modbus connections by testing combinations of connection parameters.
-    - Performs combinatorial search across connection parameters to find responsive devices.
-    - **TCP Mode:** Specify `--hosts` and `--ports` (supports CSV lists and ranges: `192.168.1.10,192.168.1.11` or `500-550`).
-    - **Serial Mode:** Specify `--serials` and `--bauds` (supports CSV: `COM3,COM4` and `9600,115200`).
-    - `--units` specifies Modbus unit IDs to test (supports ranges: `1-10` or CSV: `1,5,10`).
-    - `--address` and `--datatype` specify the target register to probe (default: holding register 0).
-    - `--timeout` sets per-probe timeout in milliseconds (default: 200ms).
-    - `--concurrency` controls maximum parallel probes for TCP (serial is always sequential to avoid port conflicts).
-    - `--attempts` sets retry count per combination (default: 1).
-    - `--backoff` sets delay between retries in milliseconds (default: 100ms).
-    - `--output` exports results to JSON file.
-    - `--alive-only` displays only responsive devices (default behavior).
-    - Shows live feedback as devices are discovered and prints summary statistics.
-    - Usage examples:
-        - `python main_cli.py probe --hosts 192.168.1.10-192.168.1.20 --ports 502,5020 --units 1-10` — probe TCP range
-        - `python main_cli.py probe --serials COM3,COM4 --bauds 9600,19200,115200 --units 1-5` — probe serial ports
-        - `python main_cli.py probe --hosts 10.0.0.1 --ports 500-550 --output results.json` — export to JSON
-
-- `write` — Write 16-bit or 32-bit values to a device.
-    - Connection/wizard behavior mirrors `read`.
-    - `--address` required.
-    - By default writes a 16-bit integer; add `--long` to write a 32-bit value (two registers).
-    - `--float` accepts float input (disallows `0xHEX`) and writes as Float16 (single register) when used without `--long`, or Float32 (two registers) when used with `--long`.
-    - `--signed` validates signed ranges; supplying a negative integer implies signed mode.
-    - `--endian` controls byte/word ordering for 16-bit (big/little) and 32-bit (big|little|mid-big|mid-little).
-    - Prior to sending the write the CLI prints a small table showing the register index, hex bytes, and numeric value that will be written.
-
-- `ports` — List available serial ports (requires `pyserial`).
-
-## Notes & Implementation Details
-- Modbus exception code mapping is provided in `umdt/modbus_exceptions.py` and used by `read`/`monitor` to give human-friendly error messages.
-- Float support:
-    - Float16 (half) encoding/decoding is supported for single-register operations.
-    - Float32 support is available for two-register (`--long`) operations with endian permutations.
-- The CLI attempts to be compatible with multiple `pymodbus` versions by adapting to different method signatures (e.g., `unit` vs `slave` keywords) where necessary.
-
-## Examples
-
-Read a single register (wizard will prompt for connection if omitted):
-
-```bash
-python main_cli.py read --address 0x10 --serial COM5 --baud 115200
+```powershell
+"C:\Program Files\Wireshark\wireshark.exe" -X lua_script:umdt_modbus_wrapper.lua -X lua_script:umdt_mbap.lua
 ```
 
-Decode locally without a device:
+- Or install the scripts permanently by copying them to your personal Wireshark plugins directory:
+  - Windows (per-user): `%APPDATA%\Wireshark\plugins\`
+  - Windows (system): `C:\Program Files\Wireshark\plugins\`
 
+#### Notes
+- UMDT PCAP record format: first 4 bytes are metadata — byte 0 = direction (1=inbound, 2=outbound), byte 1 = protocol hint (1=MODBUS_RTU, 2=MODBUS_TCP), bytes 2-3 reserved.
+- The wrapper will automatically strip that metadata for decoding. For RTU frames it will attempt CRC detection and remove the CRC before wrapping into an MBAP-like TVB.
+- The `umdt_mbap.lua` dissector tags Modbus exception responses (function >= 0x80) and adds expert-error entries so they appear highlighted in Wireshark.
+- If you prefer to decode the PCAP manually, set "Decode As" → `USER0` (147) to `umdt_modbus` (or load the wrapper script) so Wireshark uses the wrapper for these records.
+
+
+## Development Notes
+
+### Setup
+1. Install dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
+2. (Optional) Install dev dependencies for testing/building:
+   ```bash
+   pip install -r requirements-dev.txt
+   ```
+
+### Project Layout
+- `main_cli.py` / `main_gui.py`: Interactive tools.
+- `mock_server_cli.py` / `mock_server_gui.py`: Mock server tools.
+- `bridge.py`: Bridge entry point.
+- `umdt/`: Core package source.
+- `tests/`: Pytest suite.
+
+### Testing
+
+Run unit tests:
 ```bash
-python main_cli.py decode 0x4120 0x0000
+pytest
 ```
 
-Write a 16-bit integer to address 0:
-
+End-to-end (E2E) Docker tests
+- Requirements: Docker (and `docker compose`) installed. On Windows, WSL2 is recommended for CI-like environments.
+- Start the test environment and run the E2E suite:
 ```bash
-python main_cli.py write --serial COM5 --baud 115200 --address 0 500
+docker compose -f tests/e2e/docker-compose.yml up --build --abort-on-container-exit
+# in another shell (or after containers are up) run the E2E pytest suite
+pytest tests/e2e -q
+# OR run only E2E-marked tests
+pytest -m e2e
 ```
 
-Write a 32-bit float (Float32) to address 0 (two registers):
-
+UI tests
+- UI tests exercise the PySide6 GUI and require the GUI runtime and `pytest-qt` (or equivalent fixtures).
+- Install dev deps and run the UI tests:
 ```bash
-python main_cli.py write --serial COM5 --baud 115200 --address 0 --long --float -12.5
+pip install -r requirements-dev.txt
+pytest tests/ui -q
 ```
-
-Scan for readable holding registers in range 0-100:
-
-```bash
-python main_cli.py scan 0 100 --host 192.168.1.10
-```
-
-Scan for readable coils using hex addresses:
-
-```bash
-python main_cli.py scan 0x0000 0x00FF --serial COM5 --baud 115200 --datatype coil
-```
-
-Probe TCP network for devices on ports 502 and 5020:
-
-```bash
-python main_cli.py probe --hosts 192.168.1.1-192.168.1.254 --ports 502,5020 --units 1-10
-```
-
-Probe serial ports for devices at multiple baud rates:
-
-```bash
-python main_cli.py probe --serials COM3,COM4,COM5 --bauds 9600,19200,115200 --units 1-5 --output found.json
-```
-
-## GUI (interactive)
-A PySide6/qasync-based GUI is included as an interactive alternative to the CLI. It mirrors the main CLI functionality for `read`, `monitor`, and `write` while providing richer per-value decoding and a live view of activity.
-
-- Launch: `python main_gui.py` (requires `PySide6`, `qasync` and the same runtime deps in `requirements.txt`).
-- Top connection panel: choose Serial/TCP, set port/host, baud, and Unit ID; `Connect` toggles controller state.
-- Tabs:
-    - **Interact** — single-shot `Read` and `Write` panels with input validation, an immediate results table, and a details panel that shows per-endian decoding (Hex, UInt/Int, Float16/Float32). `--long` (32-bit) reads show 32-bit permutations; single-register reads show Big/Little 16-bit interpretations.
-    - **Monitor** — continuous polling with a scrolling history table and selectable rows. Selected rows populate the same decoding details panel. Monitor supports configurable poll interval and error/highlight rows for failed polls.
-    - **Scan** — address range scanner that discovers readable registers/coils. Enter start and end addresses (decimal or hex), select data type from the top connection panel, and click "Start Scan". Results appear in real-time showing decimal address, hex address, and "Readable" status. Readable addresses are highlighted in green. Progress is shown during scan ("Scanning 25/100 (found 8)..."). Use "Stop" to cancel and "Clear Results" to reset the table.
-    - **Probe** — connection discovery tool that tests combinations of connection parameters to find responsive devices. Enter comma-separated or range values for hosts/ports (TCP mode) or serials/bauds (serial mode), plus unit IDs to test. Configure timeout, concurrency, retry attempts, and backoff delay. Click "Start Probe" to begin combinatorial search. Results table shows only alive endpoints with connection URI, response summary, and response time. Supports large search spaces (warns if >1000 combinations). Use "Stop" to cancel, "Clear" to reset results, and "Export" to save findings to JSON. Serial probes run sequentially to avoid port conflicts; TCP probes run concurrently up to configured limit.
-- Details panel: when a table row is selected the details widget shows multiple endian permutations and numeric interpretations (mirrors `--endian all` behavior for single-value reads). For 32-bit longs the GUI shows the four common permutations (Big/Little/Mid-Big/Mid-Little).
-- Locking and transport: the GUI integrates with `CoreController` where available to reuse shared transport and locking semantics; when a controller isn't started the GUI falls back to thread-wrapped blocking reads/writes (same `pymodbus` compatibility layer used by the CLI).
-- Log view & status: lightweight log area shows recent operations (reads/writes/status) and a color-coded status label indicates connection state.
-
-Known limitations / notes:
-- `--endian all` is supported for single-value reads (shows Big/Little for 16-bit, and all four permutations for a single 32-bit long). For multi-value reads the CLI/GUI prefer a single selected endian to keep table layouts predictable.
-- The GUI currently reuses many CLI helpers; future refactors may extract decoding into a shared module.
-
-## Mock Server (diagnostic sandbox)
-UMDT now ships with a configurable Modbus slave that can simulate TCP or serial endpoints, inject faults, and expose register/coil behavior for demos and regression tests.
-
-- CLI entrypoint: `python mock_server_cli.py`
-    - `start --config configs/pump.json --tcp-host 0.0.0.0 --tcp-port 15020 --interactive` launches the server and opens a small REPL for runtime edits (set register values, toggle rules, update fault knobs, tail diagnostics events).
-    - `groups add/list/remove/reset` modify register groups within a JSON/YAML config.
-    - `values set/clear` manage per-address rules (frozen values, ignore-write, forced exceptions).
-    - `faults inject` patches default latency/drop/bit-flip settings in configs.
-    - `status` prints a summary (unit id, group count, latency, transport) for a config file.
-- GUI entrypoint: `python mock_server_gui.py`
-    - Provides a live control panel for loading a config, starting/stopping TCP or serial transports, writing on-the-fly values, applying rules, adjusting fault injection knobs, and viewing diagnostics events streamed from the mock device.
-    - Register groups load into a sortable table; manual write/rule widgets target any data type (holding/input/coil/discrete). Fault sliders feed directly into the diagnostics manager.
-
-Configs are YAML/JSON files (see `server.md`) that describe register groups, per-address rules, scripted values, and initial fault profiles. Both the CLI and GUI share the same asyncio-first engine, transport coordinator, and diagnostics manager so switching between front ends is seamless.
-
-## Development
-- Entry points: `main_cli.py` (diagnostics CLI), `main_gui.py` (diagnostics GUI), `mock_server_cli.py` (mock server CLI), and `mock_server_gui.py` (mock server GUI).
-- Tests: `pytest` is configured.
+- Notes: Running GUI tests on headless CI typically requires an X server or virtual framebuffer (e.g., `xvfb`) or using a Windows-native test runner. For quick local iteration on Windows, run tests directly in the desktop session.

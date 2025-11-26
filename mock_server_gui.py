@@ -141,40 +141,50 @@ class MainWindow(QtWidgets.QMainWindow):
         self.start_btn.clicked.connect(lambda: asyncio.create_task(self.start_server()))
         self.stop_btn.clicked.connect(lambda: asyncio.create_task(self.stop_server()))
 
+        # PCAP capture controls
+        self.pcap_edit = QtWidgets.QLineEdit()
+        self.pcap_edit.setPlaceholderText("Optional: path to capture.pcap")
+        pcap_browse_btn = QtWidgets.QPushButton("Browse")
+        pcap_browse_btn.clicked.connect(self._choose_pcap)
+
         grid.addWidget(QtWidgets.QLabel("Config file"), 0, 0)
         grid.addWidget(self.config_edit, 0, 1)
         grid.addWidget(browse_btn, 0, 2)
         grid.addWidget(save_btn, 0, 3)
 
-        grid.addWidget(QtWidgets.QLabel("Unit ID"), 1, 0)
-        grid.addWidget(self.unit_id_spin, 1, 1)
+        grid.addWidget(QtWidgets.QLabel("PCAP output"), 1, 0)
+        grid.addWidget(self.pcap_edit, 1, 1)
+        grid.addWidget(pcap_browse_btn, 1, 2)
 
-        grid.addWidget(QtWidgets.QLabel("Transport"), 2, 0)
-        grid.addWidget(self.transport_combo, 2, 1)
+        grid.addWidget(QtWidgets.QLabel("Unit ID"), 2, 0)
+        grid.addWidget(self.unit_id_spin, 2, 1)
+
+        grid.addWidget(QtWidgets.QLabel("Transport"), 3, 0)
+        grid.addWidget(self.transport_combo, 3, 1)
 
         tcp_row = QtWidgets.QHBoxLayout()
         tcp_row.addWidget(QtWidgets.QLabel("Host"))
         tcp_row.addWidget(self.tcp_host_edit)
         tcp_row.addWidget(QtWidgets.QLabel("Port"))
         tcp_row.addWidget(self.tcp_port_spin)
-        grid.addLayout(tcp_row, 3, 0, 1, 3)
+        grid.addLayout(tcp_row, 4, 0, 1, 3)
 
         serial_row = QtWidgets.QHBoxLayout()
         serial_row.addWidget(QtWidgets.QLabel("Serial Port"))
         serial_row.addWidget(self.serial_port_combo)
         serial_row.addWidget(QtWidgets.QLabel("Baud"))
         serial_row.addWidget(self.serial_baud_combo)
-        grid.addLayout(serial_row, 4, 0, 1, 3)
+        grid.addLayout(serial_row, 5, 0, 1, 3)
 
         # Note to make mutual exclusivity explicit
         self.transport_note = QtWidgets.QLabel("TCP and Serial are mutually exclusive — select one.")
         self.transport_note.setStyleSheet("color: gray; font-style: italic")
-        grid.addWidget(self.transport_note, 2, 2)
+        grid.addWidget(self.transport_note, 3, 2)
 
         btn_row = QtWidgets.QHBoxLayout()
         btn_row.addWidget(self.start_btn)
         btn_row.addWidget(self.stop_btn)
-        grid.addLayout(btn_row, 5, 0, 1, 3)
+        grid.addLayout(btn_row, 6, 0, 1, 3)
 
         # Ensure controls reflect the default transport selection (defaults to TCP)
         self._on_transport_changed(self.transport_combo.currentText())
@@ -342,6 +352,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if path:
             self.config_edit.setText(path)
 
+    def _choose_pcap(self) -> None:
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Select PCAP file", filter="PCAP (*.pcap)")
+        if path:
+            self.pcap_edit.setText(path)
+
     def _save_config(self) -> None:
         # assemble minimal config dict from UI
         cfg_obj = {
@@ -411,7 +426,9 @@ class MainWindow(QtWidgets.QMainWindow):
             cfg = MockServerConfig(unit_id=unit_id, groups=list(self._groups), latency_ms=self.latency_spin.value(), latency_jitter_pct=self.jitter_spin.value(), fault_profile={}, transport=transport)
 
         self.device = MockDevice(cfg)
-        self.coordinator = TransportCoordinator(self.device, unit_id=cfg.unit_id)
+        pcap_text = self.pcap_edit.text().strip()
+        pcap_path = Path(pcap_text) if pcap_text else None
+        self.coordinator = TransportCoordinator(self.device, unit_id=cfg.unit_id, pcap_path=pcap_path)
         # Update unit_id spin from loaded config
         self.unit_id_spin.setValue(cfg.unit_id)
         self.group_model.set_groups(
@@ -438,6 +455,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 label = f"Serial {port}:{baud}"
             self._event_task = asyncio.create_task(self._event_loop())
             self.event_log.appendPlainText(f"Server started on {label}")
+            if pcap_path:
+                self.event_log.appendPlainText(f"PCAP logging enabled: {pcap_path}")
             self.start_btn.setEnabled(False)
             self.stop_btn.setEnabled(True)
         except Exception as exc:  # pylint: disable=broad-except

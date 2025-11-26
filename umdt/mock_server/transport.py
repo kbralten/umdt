@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional
+import struct
+from pathlib import Path
+from typing import Optional, Union
 
 from pymodbus.constants import ExcCodes
 from pymodbus.datastore import ModbusBaseDeviceContext, ModbusServerContext
 from pymodbus.server import ModbusSerialServer, ModbusTcpServer
 
 from umdt.core.data_types import DataType
+from umdt.core.pcap import Direction, PcapWriter
 
 from .core import MockDevice, RequestDropped, RegisterAccessError
 
@@ -31,10 +34,15 @@ _FUNC_TO_TYPE = {
 class DeviceBackedContext(ModbusBaseDeviceContext):
     """Modbus context that proxies requests into the MockDevice."""
 
-    def __init__(self, device: MockDevice, unit_id: int = 1):
+    def __init__(self, device: MockDevice, unit_id: int = 1, pcap_writer: Optional[PcapWriter] = None):
         super().__init__()
         self._device = device
         self._unit_id = unit_id
+        self._pcap_writer = pcap_writer
+
+    def set_pcap_writer(self, writer: Optional[PcapWriter]) -> None:
+        """Set or clear the PCAP writer for traffic capture."""
+        self._pcap_writer = writer
 
     def _dtype(self, func_code: int) -> DataType:
         dtype = _FUNC_TO_TYPE.get(func_code)
@@ -43,9 +51,27 @@ class DeviceBackedContext(ModbusBaseDeviceContext):
         return dtype
 
     async def async_getValues(self, func_code: int, address: int, count: int = 1):
+        # Build a pseudo-MBAP request frame for PCAP logging
+        # Format: [func(1), addr(2), count(2)]
+        request_pdu = struct.pack(">BHH", func_code, address, count)
+        request_frame = self._build_mbap_frame(request_pdu)
+        await self._log_pcap(request_frame, Direction.INBOUND)
+
         try:
             dtype = self._dtype(func_code)
             values = await self._device.read(dtype, address, count)
+            # Build response frame for PCAP
+            # For read responses: [func, byte_count, data...]
+            if isinstance(values, list):
+                byte_count = len(values) * 2
+                response_pdu = struct.pack(">BB", func_code, byte_count)
+                for v in values:
+                    response_pdu += struct.pack(">H", v & 0xFFFF)
+            else:
+                response_pdu = struct.pack(">BB", func_code, 0)
+            response_frame = self._build_mbap_frame(response_pdu)
+            await self._log_pcap(response_frame, Direction.OUTBOUND)
+
             # Emit event for successful read
             await self._device.diagnostics.emit(
                 "tcp",  # Transport type (could be "serial" but we don't have that info here)
@@ -57,6 +83,9 @@ class DeviceBackedContext(ModbusBaseDeviceContext):
             )
             return values
         except RegisterAccessError as exc:
+            # Log exception response
+            exc_pdu = struct.pack(">BB", func_code | 0x80, exc.code)
+            await self._log_pcap(self._build_mbap_frame(exc_pdu), Direction.OUTBOUND)
             # Emit event for error response
             await self._device.diagnostics.emit(
                 "tcp",
@@ -76,6 +105,9 @@ class DeviceBackedContext(ModbusBaseDeviceContext):
             )
             return ExcCodes.GATEWAY_NO_RESPONSE
         except ValueError:
+            # Log exception response for illegal address
+            exc_pdu = struct.pack(">BB", func_code | 0x80, 2)  # Illegal Data Address
+            await self._log_pcap(self._build_mbap_frame(exc_pdu), Direction.OUTBOUND)
             # Emit event for illegal address
             await self._device.diagnostics.emit(
                 "tcp",
@@ -86,9 +118,33 @@ class DeviceBackedContext(ModbusBaseDeviceContext):
             return ExcCodes.ILLEGAL_ADDRESS
 
     async def async_setValues(self, func_code: int, address: int, values):
+        # Build a pseudo-MBAP request frame for PCAP logging
+        if isinstance(values, list):
+            if func_code in (5, 6):  # Single write
+                request_pdu = struct.pack(">BHH", func_code, address, values[0] if values else 0)
+            else:  # Multiple write (FC 15, 16)
+                qty = len(values)
+                byte_count = qty * 2
+                request_pdu = struct.pack(">BHHB", func_code, address, qty, byte_count)
+                for v in values:
+                    request_pdu += struct.pack(">H", v & 0xFFFF)
+        else:
+            request_pdu = struct.pack(">BHH", func_code, address, values)
+        request_frame = self._build_mbap_frame(request_pdu)
+        await self._log_pcap(request_frame, Direction.INBOUND)
+
         try:
             dtype = self._dtype(func_code)
             await self._device.write(dtype, address, values)
+            # Build response frame (echo for single, addr+qty for multiple)
+            if func_code in (5, 6):
+                response_pdu = struct.pack(">BHH", func_code, address, values[0] if isinstance(values, list) and values else values)
+            else:
+                qty = len(values) if isinstance(values, list) else 1
+                response_pdu = struct.pack(">BHH", func_code, address, qty)
+            response_frame = self._build_mbap_frame(response_pdu)
+            await self._log_pcap(response_frame, Direction.OUTBOUND)
+
             # Emit event for successful write
             value_str = str(values) if not isinstance(values, list) else f"[{len(values)} values]"
             await self._device.diagnostics.emit(
@@ -101,6 +157,9 @@ class DeviceBackedContext(ModbusBaseDeviceContext):
             )
             return None
         except RegisterAccessError as exc:
+            # Log exception response
+            exc_pdu = struct.pack(">BB", func_code | 0x80, exc.code)
+            await self._log_pcap(self._build_mbap_frame(exc_pdu), Direction.OUTBOUND)
             # Emit event for error response
             await self._device.diagnostics.emit(
                 "tcp",
@@ -120,6 +179,9 @@ class DeviceBackedContext(ModbusBaseDeviceContext):
             )
             return ExcCodes.GATEWAY_NO_RESPONSE
         except ValueError:
+            # Log exception response for illegal address
+            exc_pdu = struct.pack(">BB", func_code | 0x80, 2)  # Illegal Data Address
+            await self._log_pcap(self._build_mbap_frame(exc_pdu), Direction.OUTBOUND)
             # Emit event for illegal address
             await self._device.diagnostics.emit(
                 "tcp",
@@ -128,6 +190,22 @@ class DeviceBackedContext(ModbusBaseDeviceContext):
                 address=address,
             )
             return ExcCodes.ILLEGAL_ADDRESS
+
+    def _build_mbap_frame(self, pdu: bytes) -> bytes:
+        """Build an MBAP-like frame for PCAP logging."""
+        # MBAP header: trans_id(2), proto_id(2), length(2), unit_id(1)
+        length = len(pdu) + 1  # PDU + unit_id
+        header = struct.pack(">HHHB", 0, 0, length, self._unit_id)
+        return header + pdu
+
+    async def _log_pcap(self, frame: bytes, direction: Direction) -> None:
+        """Log a frame to the PCAP writer if configured."""
+        if self._pcap_writer:
+            await self._pcap_writer.write_packet_async(
+                data=frame,
+                direction=direction,
+                protocol=PcapWriter.PROTO_MODBUS_TCP,
+            )
 
     @staticmethod
     def _exception_from_code(code: int) -> ExcCodes:
@@ -140,14 +218,54 @@ class DeviceBackedContext(ModbusBaseDeviceContext):
 class TransportCoordinator:
     """Manage TCP or Serial Modbus server transports for the mock device."""
 
-    def __init__(self, device: MockDevice, unit_id: int = 1) -> None:
+    def __init__(self, device: MockDevice, unit_id: int = 1, pcap_path: Optional[Union[str, Path]] = None) -> None:
         self._device = device
         self._unit_id = unit_id
-        self._context = ModbusServerContext({unit_id: DeviceBackedContext(device, unit_id)}, single=False)
+        self._pcap_writer: Optional[PcapWriter] = None
+        self._pcap_path = Path(pcap_path) if pcap_path else None
+        self._device_context = DeviceBackedContext(device, unit_id)
+        self._context = ModbusServerContext({unit_id: self._device_context}, single=False)
         self._server: Optional[ModbusTcpServer | ModbusSerialServer] = None
+
+    def set_pcap_path(self, path: Optional[Union[str, Path]]) -> None:
+        """Set the PCAP output path. Call before starting the server."""
+        self._pcap_path = Path(path) if path else None
+
+    async def _start_pcap(self) -> None:
+        """Start PCAP logging if a path is configured."""
+        if self._pcap_path and not self._pcap_writer:
+            self._pcap_writer = PcapWriter(self._pcap_path)
+            self._pcap_writer.open()
+            self._device_context.set_pcap_writer(self._pcap_writer)
+            logger.info("PCAP logging started: %s", self._pcap_path)
+
+    async def _stop_pcap(self) -> None:
+        """Stop PCAP logging."""
+        if self._pcap_writer:
+            self._device_context.set_pcap_writer(None)
+            await self._pcap_writer.flush_async()
+            await self._pcap_writer.aclose()
+            logger.info(
+                "PCAP logging stopped: %d packets, %d bytes",
+                self._pcap_writer.packet_count,
+                self._pcap_writer.bytes_written,
+            )
+            self._pcap_writer = None
+
+    @property
+    def pcap_stats(self) -> dict:
+        """Get PCAP logging statistics."""
+        if not self._pcap_writer:
+            return {"packets": 0, "bytes": 0, "active": False}
+        return {
+            "packets": self._pcap_writer.packet_count,
+            "bytes": self._pcap_writer.bytes_written,
+            "active": True,
+        }
 
     async def start_tcp(self, host: str = "127.0.0.1", port: int = 1502) -> None:
         await self.stop()
+        await self._start_pcap()
         logger.info("Starting mock server TCP listener on %s:%s", host, port)
         server = ModbusTcpServer(self._context, address=(host, port))
         await server.serve_forever(background=True)
@@ -163,6 +281,7 @@ class TransportCoordinator:
 
     async def start_serial(self, port: str, baudrate: int = 9600) -> None:
         await self.stop()
+        await self._start_pcap()
         logger.info("Starting mock server serial listener on %s baud=%s", port, baudrate)
         server = ModbusSerialServer(
             self._context,
@@ -182,10 +301,12 @@ class TransportCoordinator:
 
     async def stop(self) -> None:
         if self._server is None:
+            await self._stop_pcap()
             return
         logger.info("Stopping mock server transport")
         await self._server.shutdown()
         self._server = None
+        await self._stop_pcap()
         # Emit event for server stop
         await self._device.diagnostics.emit(
             "tcp",  # Could be tcp or serial, but we don't track that
