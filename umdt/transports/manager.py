@@ -152,8 +152,11 @@ class ConnectionManager:
         attempt = 0
         while not self._stop:
             try:
-                self._notify(f"Connecting to {self.uri} (attempt {attempt})")
-                t = self.create_transport_from_uri(self.uri)
+                # Ensure `self.uri` is narrowed to a str for type checkers and runtime
+                assert isinstance(self.uri, str), "ConnectionManager.uri must be set before reconnect_loop"
+                uri: str = self.uri
+                self._notify(f"Connecting to {uri} (attempt {attempt})")
+                t = self.create_transport_from_uri(uri)
                 await t.connect()
                 self.transport = t
                 try:

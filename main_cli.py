@@ -38,8 +38,10 @@ from umdt.utils.modbus_compat import (
 
 # serial port listing (optional)
 _HAS_PYSERIAL = True
+list_ports = None
 try:
-    from serial.tools import list_ports
+    # import may fail in environments without pyserial; keep a None sentinel
+    from serial.tools import list_ports  # type: ignore
 except Exception:
     _HAS_PYSERIAL = False
 
@@ -294,6 +296,14 @@ def _extract_values(rr, bit_based: bool):
         return [rr], None
 
 
+def call_read_method(client, method_name: str, *args, **kwargs):
+    """Call a read method by name on a pymodbus client, raising AttributeError if missing."""
+    fn = getattr(client, method_name, None)
+    if fn is None:
+        raise AttributeError(f"Client does not support {method_name}")
+    return fn(*args, **kwargs)
+
+
 @app.command()
 def read(
     serial: Optional[str] = typer.Option(None, help="Serial port (e.g. COM5) to read from"),
@@ -369,6 +379,7 @@ def read(
                 client = create_client(kind='serial', serial_port=sp, baudrate=baud)
         else:
             if 'ModbusTcpClient' in globals() and ModbusTcpClient is not None:
+                assert host is not None
                 client = ModbusTcpClient(host, port=port)
             else:
                 client = create_client(kind='tcp', host=host, port=port)
@@ -380,6 +391,7 @@ def read(
         try:
             # parse address (support decimal or 0xHEX input)
             address_was_hex = False
+            assert address is not None
             if isinstance(address, str):
                 a_str = address.strip()
                 if a_str.lower().startswith("0x"):
@@ -451,6 +463,7 @@ def read(
             if err:
                 console.print(f"[red]Read error: {err}[/red]")
             else:
+                assert values is not None
                 if is_register_type(data_type):
                     regs = [int(v) & 0xFFFF for v in values]
                     if long:
@@ -578,6 +591,7 @@ def monitor(
             client = create_client(kind='serial', serial_port=sp, baudrate=baud)
     else:
         if 'ModbusTcpClient' in globals() and ModbusTcpClient is not None:
+            assert host is not None
             client = ModbusTcpClient(host, port=port)
         else:
             client = create_client(kind='tcp', host=host, port=port)
@@ -655,6 +669,7 @@ def monitor(
             if err:
                 console.print(f"[red]Read error: {err}[/red]")
             else:
+                assert values is not None
                 if is_register_type(data_type):
                     regs = [int(v) & 0xFFFF for v in values]
                     if long:
@@ -767,6 +782,7 @@ def scan(
             client = create_client(kind='serial', serial_port=sp, baudrate=baud)
     else:
         if 'ModbusTcpClient' in globals() and ModbusTcpClient is not None:
+            assert host is not None
             client = ModbusTcpClient(host, port=port)
         else:
             client = create_client(kind='tcp', host=host, port=port)
@@ -916,6 +932,8 @@ def write(
             raise typer.Exit(code=1)
 
     payload_values: List = []
+    float_val = None
+    int_val = None
     if not is_register_type(data_type):
         tokens = [part for part in str(value).replace(',', ' ').split() if part]
         if not tokens:
@@ -990,6 +1008,7 @@ def write(
             else:
                 import math
 
+                assert float_val is not None
                 f = float_val
                 if math.isnan(f):
                     half = 0x7E00
@@ -1030,6 +1049,7 @@ def write(
         else:
             width_bits = 32 if long else 16
             max_val = 1 << width_bits
+            assert int_val is not None
             int_u = int_val & (max_val - 1) if signed else int_val
             byte_len = width_bits // 8
             bv = int_u.to_bytes(byte_len, byteorder="big", signed=False)
@@ -1081,6 +1101,7 @@ def write(
             client = create_client(kind='serial', serial_port=sp, baudrate=baud)
     else:
         if 'ModbusTcpClient' in globals() and ModbusTcpClient is not None:
+            assert host is not None
             client = ModbusTcpClient(host, port=port)
         else:
             client = create_client(kind='tcp', host=host, port=port)

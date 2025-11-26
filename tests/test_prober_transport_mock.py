@@ -81,7 +81,14 @@ async def test_blocking_probe_tcp_client_success_and_exception(monkeypatch):
     # Success case (port 5502)
     alive, summary = p._blocking_probe("tcp://127.0.0.1:5502?unit=1", target, {}, timeout_s=0.1)
     assert alive is True
-    assert summary is not None and "response" in summary or "FakeResponse" in summary
+    # summary may be a str or a dict; check safely
+    assert summary is not None
+    ok = False
+    if isinstance(summary, str):
+        ok = ("response" in summary) or ("FakeResponse" in summary)
+    elif isinstance(summary, dict):
+        ok = ("response" in summary)
+    assert ok
 
     # Protocol exception case (port 5503) should be considered alive
     alive2, summary2 = p._blocking_probe("tcp://127.0.0.1:5503?unit=1", target, {}, timeout_s=0.1)

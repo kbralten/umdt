@@ -64,11 +64,12 @@ class CoreController:
                 loop.create_task(self._logger.enqueue(pkt))
             except RuntimeError:
                 # no running loop in this thread; try submitting to logger's loop if present
-                if getattr(self._logger, "loop", None):
-                    try:
-                        asyncio.run_coroutine_threadsafe(self._logger.enqueue(pkt), self._logger.loop)
-                    except Exception:
-                        pass
+                    logger_loop = getattr(self._logger, "loop", None)
+                    if logger_loop is not None:
+                        try:
+                            asyncio.run_coroutine_threadsafe(self._logger.enqueue(pkt), logger_loop)
+                        except Exception:
+                            pass
 
     def _on_status(self, msg: str):
         # status messages from ConnectionManager
@@ -86,10 +87,12 @@ class CoreController:
                 loop.create_task(self._logger.enqueue(pkt))
             except RuntimeError:
                 if getattr(self._logger, "loop", None):
-                    try:
-                        asyncio.run_coroutine_threadsafe(self._logger.enqueue(pkt), self._logger.loop)
-                    except Exception:
-                        pass
+                    logger_loop = getattr(self._logger, "loop", None)
+                    if logger_loop is not None:
+                        try:
+                            asyncio.run_coroutine_threadsafe(self._logger.enqueue(pkt), logger_loop)
+                        except Exception:
+                            pass
 
     async def start(self):
         self.running = True
@@ -270,7 +273,7 @@ class CoreController:
         data = frame[2:-2]
         return True, data
 
-    async def modbus_read_holding_registers(self, unit: int, address: int, count: int) -> Optional[List[int]]:
+    async def modbus_read_holding_registers(self, unit: int, address: int, count: int) -> Optional[Sequence[int]]:
         """Backward compatible helper for FC03."""
 
         return await self._modbus_read_registers_fc(unit, address, count, 0x03)
@@ -286,7 +289,7 @@ class CoreController:
         address: int,
         count: int,
         data_type: DataType,
-    ) -> Optional[List[Union[int, bool]]]:
+    ) -> Optional[Sequence[Union[int, bool]]]:
         props = DATA_TYPE_PROPERTIES[data_type]
         if props.read_function is None:
             return None
@@ -344,7 +347,7 @@ class CoreController:
 
     async def _modbus_read_registers_fc(
         self, unit: int, address: int, count: int, function: int
-    ) -> Optional[List[int]]:
+    ) -> Optional[Sequence[int]]:
         payload = await self._send_modbus_request(unit, function, struct.pack('>HH', address, count))
         if payload is None:
             return None
@@ -364,7 +367,7 @@ class CoreController:
 
     async def _modbus_read_bits_fc(
         self, unit: int, address: int, count: int, function: int
-    ) -> Optional[List[bool]]:
+    ) -> Optional[Sequence[bool]]:
         payload = await self._send_modbus_request(unit, function, struct.pack('>HH', address, count))
         if payload is None:
             return None

@@ -1,4 +1,4 @@
-from typing import Callable, Awaitable
+from typing import Callable, Awaitable, Optional
 from umdt.core.controller import CoreController
 
 
@@ -6,7 +6,7 @@ async def execute_with_write_access(
     controller: CoreController,
     coro_fn: Callable[[], Awaitable],
     safe_mode_flag: Callable[[], bool] = lambda: False,
-    ui_confirm: Callable[[], bool] = None,
+    ui_confirm: Optional[Callable[[], bool]] = None,
 ):
     """Execute `coro_fn` while enforcing SAFE_MODE and acquiring the transport lock.
 

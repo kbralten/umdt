@@ -11,9 +11,13 @@ The framers call registered hooks with the raw incoming bytes before delegating 
 the underlying pymodbus logic. On CRC or parse errors they emit a diagnostic hook
 instead of raising, allowing the listener task to continue.
 """
-from typing import Callable, List
+from typing import Callable, List, Any, Type, cast
 
-_raw_hooks: List[Callable] = []
+_raw_hooks: List[Callable[[bytes], None]] = []
+
+# Annotate dynamic bases so the type-checker knows these names will be classes
+_BaseRtu: Type[Any]
+_BaseSocket: Type[Any]
 
 
 def register_raw_hook(cb: Callable):
@@ -38,30 +42,37 @@ try:
     from pymodbus.framer.rtu_framer import ModbusRtuFramer as _BaseRtu
     from pymodbus.framer.socket_framer import ModbusSocketFramer as _BaseSocket
 except Exception:
-    _BaseRtu = object
-    _BaseSocket = object
+    # When pymodbus isn't present we fall back to a neutral base class.
+    # Annotate as Type[Any] and cast to keep the type-checker satisfied
+    _BaseRtu: Type[Any] = cast(Type[Any], object)
+    _BaseSocket: Type[Any] = cast(Type[Any], object)
 
 
-class UMDT_RtuFramer(_BaseRtu):
-    """Permissive RTU framer: emits raw bytes to hooks and soft-fails on parse errors."""
+class UMDT_RtuFramer:
+    """Permissive RTU framer implemented by composition.
+
+    If pymodbus's framer is available we instantiate it and delegate parsing
+    to the underlying object; otherwise the class remains a no-op sink that
+    emits raw bytes to the registered hooks.
+    """
 
     def __init__(self, *args, **kwargs):
         try:
-            super().__init__(*args, **kwargs)
+            if isinstance(_BaseRtu, type):
+                self._parent = _BaseRtu(*args, **kwargs)
+            else:
+                self._parent = None
         except Exception:
-            # If parent constructor not available (pymodbus missing), allow construction
-            pass
+            self._parent = None
 
     def processIncomingPacket(self, data: bytes, callback=None):
-        # Emit raw bytes first for logging/inspection.
         try:
             _emit_raw(bytes(data))
         except Exception:
             pass
 
-        # Delegate to parent if available, but swallow CRC/parse errors and notify hooks.
         try:
-            parent = getattr(super(), "processIncomingPacket", None)
+            parent = getattr(self._parent, "processIncomingPacket", None)
             if parent is not None:
                 return parent(data, callback)
         except Exception as exc:
@@ -69,18 +80,23 @@ class UMDT_RtuFramer(_BaseRtu):
                 _emit_raw(b"ERROR:CRC:" + str(exc).encode())
             except Exception:
                 pass
-            # swallow to avoid crashing the listener
             return None
 
 
-class UMDT_SocketFramer(_BaseSocket):
-    """Permissive Socket framer: emits raw bytes to hooks and soft-fails on parse errors."""
+class UMDT_SocketFramer:
+    """Permissive Socket framer implemented by composition.
+
+    Delegates to the underlying pymodbus socket framer when available.
+    """
 
     def __init__(self, *args, **kwargs):
         try:
-            super().__init__(*args, **kwargs)
+            if isinstance(_BaseSocket, type):
+                self._parent = _BaseSocket(*args, **kwargs)
+            else:
+                self._parent = None
         except Exception:
-            pass
+            self._parent = None
 
     def processIncomingPacket(self, data: bytes, callback=None):
         try:
@@ -89,7 +105,7 @@ class UMDT_SocketFramer(_BaseSocket):
             pass
 
         try:
-            parent = getattr(super(), "processIncomingPacket", None)
+            parent = getattr(self._parent, "processIncomingPacket", None)
             if parent is not None:
                 return parent(data, callback)
         except Exception as exc:

@@ -225,9 +225,11 @@ class Prober:
         scheme = parsed.scheme or 'serial'
         qs = parse_qs(parsed.query or "")
         unit = None
-        if qs:
+        # Normalize unit parsing: only convert when a unit value is present
+        unit_list = qs.get('unit')
+        if unit_list:
             try:
-                unit = int(qs.get('unit', [None])[0]) if qs.get('unit') else None
+                unit = int(unit_list[0])
             except Exception:
                 unit = None
         # allow override from params
@@ -245,10 +247,24 @@ class Prober:
                     try:
                         baud = int(baud_s)
                     except Exception:
-                        baud = params.get('baud')
+                        # fallback to param-specified baud if available
+                        try:
+                            b = params.get('baud')
+                            baud = int(b) if b is not None else 115200
+                        except Exception:
+                            baud = 115200
                 else:
                     port = netloc or params.get('serial')
-                    baud = params.get('baud')
+                    try:
+                        b = params.get('baud')
+                        baud = int(b) if b is not None else 115200
+                    except Exception:
+                        baud = 115200
+                # Ensure baud is an int for create_client signature
+                try:
+                    baud = int(baud)
+                except Exception:
+                    baud = 115200
                 # Create a compat client and disable retries for serial probes
                 try:
                     client = create_client(kind='serial', serial_port=port, baudrate=baud, timeout=timeout_s, retries=0)
@@ -256,7 +272,15 @@ class Prober:
                     client = create_client(kind='serial', serial_port=port, baudrate=baud)
             else:
                 host = parsed.hostname or params.get('host') or '127.0.0.1'
-                tcp_port = parsed.port or int(params.get('port', 502))
+                # Normalize tcp_port: prefer parsed.port, else try params['port'], else default
+                if parsed.port is not None:
+                    tcp_port = int(parsed.port)
+                else:
+                    try:
+                        p = params.get('port')
+                        tcp_port = int(p) if p is not None else 502
+                    except Exception:
+                        tcp_port = 502
                 try:
                     client = create_client(kind='tcp', host=host, port=tcp_port, timeout=timeout_s)
                 except Exception:

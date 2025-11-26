@@ -2,9 +2,10 @@ import asyncio
 import struct
 
 from umdt.core.controller import CoreController
+from umdt.transports.base import TransportInterface
 
 
-class FakeTransport:
+class FakeTransport(TransportInterface):
     def __init__(self, responses=None):
         self._responses = list(responses or [])
         self.sent = []

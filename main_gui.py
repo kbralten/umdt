@@ -55,6 +55,7 @@ from umdt.utils.modbus_compat import (
     invoke_method,
 )
 from umdt.utils.decoding import decode_registers, decode_to_table_dict
+from umdt.utils.parsing import expand_csv_or_range
 import logging
 import inspect
 
@@ -73,7 +74,7 @@ class ReadRow:
     index: str
     hex_value: str
     int_value: Optional[int]
-    float16: Optional[float]
+    float16: Optional[Union[float, str]]
     data_type: DataType
     bool_value: Optional[bool] = None
 
@@ -2324,7 +2325,7 @@ class MainWindow(QMainWindow):
                         unit,
                         self._connection_uri,
                     )
-                    regs = [int(r.int_value) & 0xFFFF for r in rows] if rows else []
+                    regs = [int(r.int_value or 0) & 0xFFFF for r in rows] if rows else []
 
                     # Create one sample with all raw register values for this interval
                     sample = MonitorSample(
