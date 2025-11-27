@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import struct
 from pathlib import Path
-from typing import Optional, Union
+from typing import List, Optional, Union
 
 from pymodbus.constants import ExcCodes
 from pymodbus.datastore import ModbusBaseDeviceContext, ModbusServerContext
@@ -11,8 +11,10 @@ from pymodbus.server import ModbusSerialServer, ModbusTcpServer
 
 from umdt.core.data_types import DataType
 from umdt.core.pcap import Direction, PcapWriter
+from umdt.core.script_engine import ExceptionResponse, ScriptRequest
 
 from .core import MockDevice, RequestDropped, RegisterAccessError
+from .script_hook import MockServerScriptHook
 
 logger = logging.getLogger(__name__)
 
@@ -34,15 +36,21 @@ _FUNC_TO_TYPE = {
 class DeviceBackedContext(ModbusBaseDeviceContext):
     """Modbus context that proxies requests into the MockDevice."""
 
-    def __init__(self, device: MockDevice, unit_id: int = 1, pcap_writer: Optional[PcapWriter] = None):
+    def __init__(self, device: MockDevice, unit_id: int = 1, pcap_writer: Optional[PcapWriter] = None,
+                 script_hook: Optional[MockServerScriptHook] = None):
         super().__init__()
         self._device = device
         self._unit_id = unit_id
         self._pcap_writer = pcap_writer
+        self._script_hook = script_hook
 
     def set_pcap_writer(self, writer: Optional[PcapWriter]) -> None:
         """Set or clear the PCAP writer for traffic capture."""
         self._pcap_writer = writer
+
+    def set_script_hook(self, hook: Optional[MockServerScriptHook]) -> None:
+        """Set or clear the script hook for request/response interception."""
+        self._script_hook = hook
 
     def _dtype(self, func_code: int) -> DataType:
         dtype = _FUNC_TO_TYPE.get(func_code)
@@ -56,6 +64,35 @@ class DeviceBackedContext(ModbusBaseDeviceContext):
         request_pdu = struct.pack(">BHH", func_code, address, count)
         request_frame = self._build_mbap_frame(request_pdu)
         await self._log_pcap(request_frame, Direction.INBOUND)
+
+        # Run request through script hooks (if configured)
+        if self._script_hook and self._script_hook.has_hooks():
+            result = await self._script_hook.process_request(
+                func_code=func_code,
+                address=address,
+                count=count,
+                unit_id=self._unit_id,
+            )
+            if result is None:
+                # Script blocked the request
+                logger.debug("Request blocked by script hook")
+                return ExcCodes.GATEWAY_NO_RESPONSE
+            elif isinstance(result, ExceptionResponse):
+                # Script returned an exception
+                exc_pdu = struct.pack(">BB", func_code | 0x80, result.code)
+                await self._log_pcap(self._build_mbap_frame(exc_pdu), Direction.OUTBOUND)
+                await self._device.diagnostics.emit(
+                    "tcp",
+                    f"Script exception: func={func_code}, addr={address}, code={result.code}",
+                    func_code=func_code,
+                    address=address,
+                    exception_code=result.code,
+                )
+                return self._exception_from_code(result.code)
+            elif isinstance(result, ScriptRequest):
+                # Use possibly modified request parameters
+                address = result.address
+                count = result.count
 
         try:
             dtype = self._dtype(func_code)
@@ -132,6 +169,38 @@ class DeviceBackedContext(ModbusBaseDeviceContext):
             request_pdu = struct.pack(">BHH", func_code, address, values)
         request_frame = self._build_mbap_frame(request_pdu)
         await self._log_pcap(request_frame, Direction.INBOUND)
+
+        # Run request through script hooks (if configured)
+        values_list = values if isinstance(values, list) else [values]
+        if self._script_hook and self._script_hook.has_hooks():
+            result = await self._script_hook.process_request(
+                func_code=func_code,
+                address=address,
+                count=len(values_list),
+                unit_id=self._unit_id,
+                values=values_list,
+            )
+            if result is None:
+                # Script blocked the request
+                logger.debug("Write request blocked by script hook")
+                return ExcCodes.GATEWAY_NO_RESPONSE
+            elif isinstance(result, ExceptionResponse):
+                # Script returned an exception
+                exc_pdu = struct.pack(">BB", func_code | 0x80, result.code)
+                await self._log_pcap(self._build_mbap_frame(exc_pdu), Direction.OUTBOUND)
+                await self._device.diagnostics.emit(
+                    "tcp",
+                    f"Script exception: func={func_code}, addr={address}, code={result.code}",
+                    func_code=func_code,
+                    address=address,
+                    exception_code=result.code,
+                )
+                return self._exception_from_code(result.code)
+            elif isinstance(result, ScriptRequest):
+                # Use possibly modified request parameters
+                address = result.address
+                if result.values is not None:
+                    values = result.values
 
         try:
             dtype = self._dtype(func_code)
@@ -218,14 +287,32 @@ class DeviceBackedContext(ModbusBaseDeviceContext):
 class TransportCoordinator:
     """Manage TCP or Serial Modbus server transports for the mock device."""
 
-    def __init__(self, device: MockDevice, unit_id: int = 1, pcap_path: Optional[Union[str, Path]] = None) -> None:
+    def __init__(
+        self,
+        device: MockDevice,
+        unit_id: int = 1,
+        pcap_path: Optional[Union[str, Path]] = None,
+        scripts: Optional[List[Union[str, Path]]] = None,
+    ) -> None:
         self._device = device
         self._unit_id = unit_id
         self._pcap_writer: Optional[PcapWriter] = None
         self._pcap_path = Path(pcap_path) if pcap_path else None
-        self._device_context = DeviceBackedContext(device, unit_id)
+        self._script_hook: Optional[MockServerScriptHook] = None
+        
+        # Load scripts if provided
+        if scripts:
+            self._script_hook = MockServerScriptHook(scripts=scripts, name="mock_server")
+            logger.info("Loaded %d script(s) for mock server", len(scripts))
+        
+        self._device_context = DeviceBackedContext(device, unit_id, script_hook=self._script_hook)
         self._context = ModbusServerContext({unit_id: self._device_context}, single=False)
         self._server: Optional[ModbusTcpServer | ModbusSerialServer] = None
+
+    @property
+    def script_hook(self) -> Optional[MockServerScriptHook]:
+        """Get the script hook instance (if configured)."""
+        return self._script_hook
 
     def set_pcap_path(self, path: Optional[Union[str, Path]]) -> None:
         """Set the PCAP output path. Call before starting the server."""
@@ -266,6 +353,9 @@ class TransportCoordinator:
     async def start_tcp(self, host: str = "127.0.0.1", port: int = 1502) -> None:
         await self.stop()
         await self._start_pcap()
+        # Start periodic hooks if configured
+        if self._script_hook:
+            await self._script_hook.start_periodic_hooks()
         logger.info("Starting mock server TCP listener on %s:%s", host, port)
         server = ModbusTcpServer(self._context, address=(host, port))
         await server.serve_forever(background=True)
@@ -282,6 +372,9 @@ class TransportCoordinator:
     async def start_serial(self, port: str, baudrate: int = 9600) -> None:
         await self.stop()
         await self._start_pcap()
+        # Start periodic hooks if configured
+        if self._script_hook:
+            await self._script_hook.start_periodic_hooks()
         logger.info("Starting mock server serial listener on %s baud=%s", port, baudrate)
         server = ModbusSerialServer(
             self._context,
@@ -300,6 +393,9 @@ class TransportCoordinator:
         )
 
     async def stop(self) -> None:
+        # Stop script hooks first
+        if self._script_hook:
+            await self._script_hook.stop()
         if self._server is None:
             await self._stop_pcap()
             return
@@ -312,6 +408,13 @@ class TransportCoordinator:
             "tcp",  # Could be tcp or serial, but we don't track that
             "Server stopped",
         )
+
+    def get_stats(self) -> dict:
+        """Get combined stats for PCAP and scripts."""
+        stats = {"pcap": self.pcap_stats}
+        if self._script_hook:
+            stats["scripts"] = self._script_hook.get_stats()
+        return stats
 
     async def restart(self, *, host: Optional[str] = None, port: Optional[int] = None, serial_port: Optional[str] = None, baudrate: Optional[int] = None) -> None:
         if serial_port:
