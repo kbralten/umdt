@@ -149,6 +149,12 @@ def start(
         "-p",
         help="Write traffic to PCAP file for Wireshark analysis",
     ),
+    script: Optional[list[str]] = typer.Option(
+        None,
+        "--script",
+        "-s",
+        help="Python script file(s) for logic injection (can be repeated)",
+    ),
 ) -> None:
     """Start the Modbus bridge.
 
@@ -221,7 +227,12 @@ def start(
         downstream_serial_port=downstream_serial,
         downstream_baudrate=downstream_baud,
         timeout=timeout,
+        scripts=script,
     )
+
+    # Display script info if loaded
+    if script:
+        console.print(f"[cyan]Scripts loaded: {', '.join(script)}[/cyan]")
 
     # Add a logging hook to show traffic
     async def log_request(request, context):
@@ -319,11 +330,16 @@ def info() -> None:
             "[bold]Features:[/bold]\n"
             "  • TCP ↔ RTU protocol conversion (MBAP ↔ CRC framing)\n"
             "  • Multiple upstream client support with request queuing\n"
-            "  • Extensible hook architecture for future logic injection\n"
-            "  • Prepared for MQTT telemetry and PCAP logging sidecars\n\n"
+            "  • Python script injection for custom logic (--script)\n"
+            "  • PCAP traffic logging for Wireshark analysis (--pcap)\n\n"
+            "[bold]Script API:[/bold]\n"
+            "  Scripts can define these hooks:\n"
+            "  • on_request(req, ctx) - Intercept/modify/block requests\n"
+            "  • on_response(resp, ctx) - Intercept/modify responses\n"
+            "  Return ExceptionResponse(code) to reject a request.\n\n"
             "[bold]Common Use Cases:[/bold]\n"
             "  • Connect TCP-only SCADA to legacy RS-485 devices\n"
-            "  • Add network access to serial-only PLCs\n"
+            "  • Add safety interlocks without modifying PLC firmware\n"
             "  • Inspect and log Modbus traffic transparently\n",
             title="About",
         )

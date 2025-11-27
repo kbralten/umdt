@@ -7,11 +7,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Optional
+from pathlib import Path
+from typing import List, Optional, Union
 
 from .downstream import DownstreamClient
+from .hooks.script_hook import ScriptHook
 from .pipeline import BridgePipeline
-from .protocol import FrameType
+from .protocol import FrameType, ModbusFrameParser
 from .upstream import ClientSession, UpstreamServer
 
 logger = logging.getLogger("umdt.bridge")
@@ -53,6 +55,8 @@ class Bridge:
         downstream_baudrate: int = 9600,
         # Options
         timeout: float = 2.0,
+        # Script configuration
+        scripts: Optional[List[Union[str, Path]]] = None,
     ):
         self.upstream_type = upstream_type
         self.downstream_type = downstream_type
@@ -80,10 +84,36 @@ class Bridge:
             timeout=timeout,
         )
 
+        # Script hook for logic injection
+        self._script_hook: Optional[ScriptHook] = None
+        if scripts:
+            self._setup_scripts(scripts)
+
         # Wire up the request handler
         self._upstream.set_request_handler(self._handle_request)
 
         self._running = False
+
+    def _setup_scripts(self, scripts: List[Union[str, Path]]) -> None:
+        """Load and configure script hooks."""
+        self._script_hook = ScriptHook(name="bridge")
+
+        for script_path in scripts:
+            path = Path(script_path)
+            if path.exists():
+                logger.info("Loading script: %s", path)
+                self._script_hook.load_script_file(path)
+            else:
+                logger.warning("Script file not found: %s", path)
+
+        # Register hooks with pipeline
+        if self._script_hook.engine.has_request_hooks():
+            self._pipeline.add_ingress_hook(self._script_hook.ingress_hook)
+            logger.info("Script request hooks registered")
+
+        if self._script_hook.engine.has_response_hooks():
+            self._pipeline.add_response_hook(self._script_hook.response_hook)
+            logger.info("Script response hooks registered")
 
     async def start(self) -> None:
         """Start the bridge (upstream server and downstream client)."""
@@ -145,6 +175,15 @@ class Bridge:
         # Process request through pipeline (may modify or block)
         downstream_frame = await self._pipeline.process_request(request_frame)
         if downstream_frame is None:
+            # Check if script hook generated an exception
+            if self._script_hook:
+                exc = self._script_hook.get_pending_exception()
+                if exc:
+                    return self._build_exception_response(
+                        request_frame,
+                        exc["function_code"],
+                        exc["code"],
+                    )
             logger.debug("Request blocked by pipeline")
             return None
 
@@ -162,12 +201,89 @@ class Bridge:
 
         return upstream_frame
 
+    def _build_exception_response(
+        self,
+        request_frame: bytes,
+        function_code: int,
+        exception_code: int,
+    ) -> bytes:
+        """Build an exception response frame."""
+        from .protocol import ModbusPDU
+
+        exc_pdu = ModbusPDU(
+            function_code=function_code | 0x80,
+            data=bytes([exception_code]),
+        )
+
+        # Get transaction ID from request if TCP
+        if self.upstream_type == FrameType.TCP:
+            transaction_id = ModbusFrameParser.extract_mbap_transaction_id(request_frame)
+            # Get unit_id from request
+            if len(request_frame) >= 7:
+                unit_id = request_frame[6]
+            else:
+                unit_id = 1
+            return ModbusFrameParser.build_tcp_frame(unit_id, exc_pdu, transaction_id)
+        else:
+            # RTU - get unit_id from request
+            unit_id = request_frame[0] if len(request_frame) >= 1 else 1
+            return ModbusFrameParser.build_rtu_frame(unit_id, exc_pdu)
+
     # --- Pipeline Access ---
 
     @property
     def pipeline(self) -> BridgePipeline:
         """Access the pipeline for adding hooks."""
         return self._pipeline
+
+    @property
+    def script_hook(self) -> Optional[ScriptHook]:
+        """Access the script hook if configured."""
+        return self._script_hook
+
+    def load_script(self, source: str, name: str = "inline") -> None:
+        """Load a script from source code.
+        
+        Args:
+            source: Python script source
+            name: Identifier for this script
+        """
+        if not self._script_hook:
+            self._script_hook = ScriptHook(name="bridge")
+            # Register hooks with pipeline
+            self._pipeline.add_ingress_hook(self._script_hook.ingress_hook)
+            self._pipeline.add_response_hook(self._script_hook.response_hook)
+
+        self._script_hook.load_script(source, name)
+        logger.info("Loaded script: %s", name)
+
+    def load_script_file(self, path: Union[str, Path]) -> None:
+        """Load a script from a file.
+        
+        Args:
+            path: Path to the script file
+        """
+        if not self._script_hook:
+            self._script_hook = ScriptHook(name="bridge")
+            self._pipeline.add_ingress_hook(self._script_hook.ingress_hook)
+            self._pipeline.add_response_hook(self._script_hook.response_hook)
+
+        self._script_hook.load_script_file(path)
+        logger.info("Loaded script file: %s", path)
+
+    def set_script_state(self, key: str, value: any) -> None:
+        """Set a value in the script context state.
+        
+        Useful for initializing state that scripts can access.
+        """
+        if self._script_hook:
+            self._script_hook.set_state(key, value)
+
+    def get_script_state(self, key: str, default: any = None) -> any:
+        """Get a value from the script context state."""
+        if self._script_hook:
+            return self._script_hook.get_state(key, default)
+        return default
 
     # --- Helpers ---
 
@@ -189,9 +305,12 @@ class Bridge:
 
     def get_stats(self) -> dict:
         """Get bridge statistics."""
-        return {
+        stats = {
             "running": self._running,
             "upstream_clients": self._upstream.client_count,
             "downstream_connected": self._downstream.is_connected,
             **self._pipeline.get_stats(),
         }
+        if self._script_hook:
+            stats["script"] = self._script_hook.get_stats()
+        return stats
