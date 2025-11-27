@@ -86,12 +86,35 @@ A transparent bridge for routing Modbus traffic between different transports (e.
 - `info`: Show bridge status and capabilities.
 
 ### PCAP Logging (Forensic Capture)
-The bridge can capture all Modbus traffic to a PCAP file for analysis in Wireshark or similar tools.
+The bridge can capture Modbus traffic to PCAP file(s) for analysis in Wireshark.
+
+Modes:
+- **Combined (legacy)**: Single file containing all traffic.
+- **Dual-stream (recommended)**: Separate files for upstream and downstream conversations.
+
+Example (combined):
 ```bash
-# Capture traffic while bridging
+# Capture traffic while bridging (single file)
 python bridge.py start --upstream-port 5503 --downstream-host 127.0.0.1 --downstream-port 5502 --pcap capture.pcap
 ```
-The PCAP uses `DLT_USER0` (147) linktype with a 4-byte metadata header indicating direction (inbound/outbound) and protocol (RTU/TCP). Open in Wireshark and use "Decode As" → "User DLT" to inspect frames.
+
+Example (dual-stream):
+```bash
+# Upstream: Master <-> Bridge traffic
+# Downstream: Bridge <-> Slave traffic
+python bridge.py start --upstream-port 5503 --downstream-host 127.0.0.1 --downstream-port 5502 \
+  --pcap-upstream upstream.pcap --pcap-downstream downstream.pcap
+```
+
+What goes into each file:
+- **Upstream PCAP** (`--pcap-upstream`): complete Master ↔ Bridge conversation
+  - Master → Bridge (logged by `ingress_hook`, direction: INBOUND)
+  - Bridge → Master (logged by `upstream_response_hook`, direction: OUTBOUND)
+- **Downstream PCAP** (`--pcap-downstream`): complete Bridge ↔ Slave conversation
+  - Bridge → Slave (logged by `egress_hook`, direction: OUTBOUND)
+  - Slave → Bridge (logged by `response_hook`, direction: INBOUND)
+
+The PCAP records use `DLT_USER0` (147) with a 4-byte UMDT metadata header: byte 0 = direction (1=inbound, 2=outbound), byte 1 = protocol hint (1=MODBUS_RTU, 2=MODBUS_TCP), bytes 2-3 reserved. The provided Wireshark Lua wrapper scripts will strip this metadata and decode Modbus frames.
 
 ### Wireshark Lua plugin
 We provide two Lua scripts to make UMDT PCAPs decode nicely in Wireshark:
