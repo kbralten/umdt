@@ -65,6 +65,72 @@ A configurable Modbus slave for development, testing, and demos. It supports fau
 - `values`: Set static values or rules (e.g., freeze value, error on write).
 - `faults`: Inject network faults (latency, packet drops).
 
+### Scripting and Automation (Mock Server)
+The mock server includes a lightweight ScriptEngine for custom behavior and automation. Scripts are Python-based and can be attached via the server configuration or loaded at runtime from the CLI/GUI.
+
+ - **What scripts can do:**
+   - Provide custom request/response handlers to implement non-standard device logic.
+   - Generate dynamic register values (timers, counters, or procedurally generated data).
+   - Inject faults (delays, dropped responses, exception replies) for testing resilience.
+   - React to events (on-start, on-stop, on-write) and emit state changes to the GUI/CLI.
+
+ - **Deployment:**
+   - Add script entries to the server config to load at startup, or use the `--script` CLI/GUI controls to load/unload during a running session.
+   - Scripts run in a restricted, async-friendly environment exposed by the ScriptEngine API (request/response objects, scheduler utilities, logging). See `server.md` and the `umdt/mock_server/scripts/` examples for patterns.
+
+ This makes the mock server suitable for realistic simulation, regression tests, and automated E2E scenarios.
+
+### Hooks & ScriptEngine API
+The Mock Server exposes a small set of hook entry points that scripts can implement to intercept or synthesize traffic and lifecycle events. Hooks are executed inside the ScriptEngine and are async-friendly.
+
+ - **Common hook signatures:**
+   - `async def on_request(request, context)` — called when a request arrives; may return a `Response` to short-circuit handling or `None` to continue normal processing.
+   - `async def on_response(response, context)` — called when a response is about to be sent (after handler logic).
+   - `async def on_write(unit_id, address, value, context)` — notified when a write request changes register state.
+   - `async def on_start(context)` / `async def on_stop(context)` — lifecycle hooks for startup/shutdown tasks.
+   - `async def on_timer(name, context)` — called by scheduled timers registered via the ScriptEngine scheduler.
+
+ - **Capabilities provided by the ScriptEngine:**
+   - Scheduler utilities for one-shot or periodic timers.
+   - Access to the server's register map and metadata (read/write helpers with concurrency control).
+   - Helpers for injecting faults (latency, exceptions, packet drops) and emitting events to the GUI/CLI.
+   - Logging and metrics hooks scoped to the script instance.
+
+ - **Example script (simple counter):**
+   ```python
+   # scripts/counter.py
+   from asyncio import sleep
+
+   async def on_start(ctx):
+       ctx.log.info("counter script started")
+       ctx.state["count"] = 0
+
+       async def tick():
+           while True:
+               ctx.state["count"] += 1
+               # write to register 1000 for unit 1
+               await ctx.write_register(unit=1, address=1000, value=ctx.state["count"])
+               await sleep(1)
+
+       ctx.schedule_task(tick())
+
+   async def on_request(request, ctx):
+       # short-circuit a read for a special address
+       if request.function_code == 3 and request.address == 9999:
+           return ctx.make_response_exception(request, exception_code=1)
+       return None
+   ```
+
+ - **Config / CLI:**
+   - Add to YAML config:
+     ```yaml
+     scripts:
+       - path: scripts/counter.py
+         enabled: true
+     ```
+   - Or load at runtime via CLI/GUI: `mock_server_cli.py start --script scripts/counter.py`.
+
+ See `umdt/mock_server/scripts/` for additional examples demonstrating fault injection, timers, and custom protocol behavior.
 ### GUI (`mock_server_gui.py`)
 A control panel for the mock server to visualize state, modify values on-the-fly, and control fault injection sliders.
 
@@ -151,6 +217,26 @@ You may need to provide the full path instead of relative paths to the Lua scrip
 - The `umdt_mbap.lua` dissector tags Modbus exception responses (function >= 0x80) and adds expert-error entries so they appear highlighted in Wireshark.
 - If you prefer to decode the PCAP manually, set "Decode As" → `USER0` (147) to `umdt_modbus` (or load the wrapper script) so Wireshark uses the wrapper for these records.
 
+
+### Bridge Scripting: Logic Engine and Hooks
+The Bridge includes a Logic Engine that lets you run small, async-friendly Python scripts to inspect, modify, or react to Modbus traffic as it flows through the pipeline. Scripts are registered as hooks and executed without blocking I/O.
+
+- **Hook entry points:**
+  - `ingress_hook(request, context)` — upstream requests (Master → Bridge)
+  - `egress_hook(request, context)` — outbound requests to downstream (Bridge → Slave)
+  - `response_hook(response, context)` — responses from downstream (Slave → Bridge)
+  - `upstream_response_hook(response, context)` — responses forwarded to upstream (Bridge → Master)
+
+- **Typical uses:**
+  - Transform addresses, function codes, or payloads for protocol adaptation.
+  - Implement filtering, access-control, or mapping rules.
+  - Inject or correct fields to emulate gateway logic or vendor quirks.
+  - Schedule background tasks, metrics, or conditional faults.
+
+- **Enabling scripts:**
+  - Configure scripts via the bridge config or load them at runtime using CLI/management commands; the bridge supports reloadable hooks for iterative development.
+
+See `umdt/bridge/scripts/` for examples and the `bridge.py` help text for available runtime flags.
 
 ## Development Notes
 
