@@ -1,5 +1,3 @@
-from asyncio import sleep
-
 async def on_start(ctx):
     ctx.log.info("mock_counter started")
     ctx.state['count'] = 0
@@ -16,4 +14,5 @@ async def on_request(request, ctx):
     # Short-circuit reads for a special address
     if request.function_code == 3 and getattr(request, 'address', None) == 9999:
         return ctx.make_response_exception(request, exception_code=1)
-    return None
+    # Passthrough - return the request unchanged
+    return request

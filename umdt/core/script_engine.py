@@ -196,11 +196,20 @@ class ScriptContext:
     Provides:
       - state: Persistent dictionary for inter-call state
       - metadata: Bridge/server configuration and runtime info
-      - logger: Logging instance for script output
+      - logger / log: Logging instance for script output
+      - schedule_task(): Schedule background async tasks
+      - sleep(): Cooperative sleep
+      - make_response_exception(): Create Modbus exception response
     """
     state: Dict[str, Any] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)
     logger: logging.Logger = field(default_factory=lambda: logging.getLogger("umdt.script"))
+    _tasks: List[asyncio.Task] = field(default_factory=list, repr=False)
+
+    @property
+    def log(self) -> logging.Logger:
+        """Alias for logger, for convenience in scripts."""
+        return self.logger
 
     def get(self, key: str, default: Any = None) -> Any:
         """Get a value from state."""
@@ -209,6 +218,38 @@ class ScriptContext:
     def set(self, key: str, value: Any) -> None:
         """Set a value in state."""
         self.state[key] = value
+
+    def schedule_task(self, coro) -> asyncio.Task:
+        """Schedule an async task to run in background (fire-and-forget).
+        
+        Tasks are tracked and can be cancelled via cancel_all_tasks().
+        """
+        task = asyncio.create_task(coro)
+        self._tasks.append(task)
+        return task
+
+    async def sleep(self, seconds: float) -> None:
+        """Cooperative sleep for scripts (wraps asyncio.sleep)."""
+        await asyncio.sleep(seconds)
+
+    def make_response_exception(self, request, exception_code: int = 0x02) -> ExceptionResponse:
+        """Create a Modbus exception response for the given request.
+        
+        Args:
+            request: The original request (used for context/logging)
+            exception_code: Modbus exception code (default 0x02 = Illegal Data Address)
+        
+        Returns:
+            ExceptionResponse object that the engine will convert to proper Modbus exception
+        """
+        return ExceptionResponse(code=exception_code)
+
+    def cancel_all_tasks(self) -> None:
+        """Cancel all scheduled background tasks."""
+        for task in self._tasks:
+            if not task.done():
+                task.cancel()
+        self._tasks.clear()
 
 
 # Script callback type hints

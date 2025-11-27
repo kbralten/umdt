@@ -1134,14 +1134,17 @@ def write(
                 if fn is None:
                     raise AttributeError(f"Client does not support {props.pymodbus_write_method}")
                 res = fn(numeric_address, payload_values, unit)
+
+        # Check for Modbus exception response
+        if hasattr(res, "isError") and res.isError():
+            console.print(f"[red]Write error: {res}[/red]")
+            raise typer.Exit(code=1)
+        else:
+            console.print("[green]Write OK[/green]")
+
     except AttributeError as exc:
         console.print(str(exc))
         raise typer.Exit(code=1)
-
-        if hasattr(res, "isError") and res.isError():
-            console.print("[red]Write failed[/red]")
-        else:
-            console.print("[green]Write OK[/green]")
     finally:
         close_client(client)
 

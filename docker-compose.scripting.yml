@@ -1,0 +1,86 @@
+# Docker Compose for UMDT E2E Scripting Tests
+# Extends the base E2E setup with script-enabled services
+#
+# Topology:
+#   cli -> bridge:5020 (with interlock script) -> mock-server:5021 (with counter script)
+#
+# Test scenarios:
+#   1. Mock server counter script increments register 1000
+#   2. Bridge interlock script blocks motor start when not ready
+#   3. Protected address blocking (mock server script)
+
+services:
+  mock-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: umdt-mock-server-script
+    command: 
+      - "python"
+      - "mock_server_cli.py"
+      - "start"
+      - "--config=/app/docker/e2e_config.yaml"
+      - "--tcp-host=0.0.0.0"
+      - "--tcp-port=5021"
+      - "--script=/app/examples/scripts/mock_server_counter.py"
+    expose:
+      - "5021"
+    volumes:
+      - ./docker:/app/docker:ro
+      - ./examples:/app/examples:ro
+    networks:
+      - umdt-script-net
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s=socket.socket(); s.settimeout(1); s.connect(('localhost',5021)); s.close()"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile.bridge
+    container_name: umdt-bridge-script
+    command: 
+      - "start"
+      - "--upstream-host=0.0.0.0"
+      - "--upstream-port=5020"
+      - "--downstream-host=mock-server"
+      - "--downstream-port=5021"
+      - "--script=/app/examples/scripts/bridge_interlock.py"
+      - "--verbose"
+    ports:
+      - "5020:5020"
+    expose:
+      - "5020"
+    depends_on:
+      mock-server:
+        condition: service_healthy
+    networks:
+      - umdt-script-net
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s=socket.socket(); s.settimeout(1); s.connect(('localhost',5020)); s.close()"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  cli:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: umdt-cli-script
+    depends_on:
+      bridge:
+        condition: service_healthy
+    networks:
+      - umdt-script-net
+    volumes:
+      - ./docker:/app/docker:ro
+      - ./examples:/app/examples:ro
+    command: ["sleep", "infinity"]
+
+networks:
+  umdt-script-net:
+    driver: bridge
