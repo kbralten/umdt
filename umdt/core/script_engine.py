@@ -36,7 +36,6 @@ import ast
 import asyncio
 import logging
 import time
-import traceback
 from dataclasses import dataclass, field
 from enum import IntEnum
 from pathlib import Path
@@ -398,10 +397,10 @@ class ScriptEngine:
             if isinstance(node, ast.Import):
                 # Only allow safe modules
                 for alias in node.names:
-                    if alias.name not in ("struct", "time", "math", "re"):
+                    if alias.name not in ("struct", "time", "math", "re", "random"):
                         raise ScriptLoadError(f"Import not allowed: {alias.name}")
             elif isinstance(node, ast.ImportFrom):
-                if node.module not in ("struct", "time", "math", "re"):
+                if node.module not in ("struct", "time", "math", "re", "random"):
                     raise ScriptLoadError(f"Import from '{node.module}' not allowed")
             elif isinstance(node, ast.Call):
                 # Check for dangerous function calls

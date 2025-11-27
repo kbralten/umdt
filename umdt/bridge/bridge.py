@@ -8,7 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import Any, List, Optional, Union
 
 from .downstream import DownstreamClient
 from .hooks.script_hook import ScriptHook
@@ -271,7 +271,7 @@ class Bridge:
         self._script_hook.load_script_file(path)
         logger.info("Loaded script file: %s", path)
 
-    def set_script_state(self, key: str, value: any) -> None:
+    def set_script_state(self, key: str, value: Any) -> None:
         """Set a value in the script context state.
         
         Useful for initializing state that scripts can access.
@@ -279,7 +279,7 @@ class Bridge:
         if self._script_hook:
             self._script_hook.set_state(key, value)
 
-    def get_script_state(self, key: str, default: any = None) -> any:
+    def get_script_state(self, key: str, default: Any = None) -> Any:
         """Get a value from the script context state."""
         if self._script_hook:
             return self._script_hook.get_state(key, default)
