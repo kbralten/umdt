@@ -147,7 +147,19 @@ def start(
         None,
         "--pcap",
         "-p",
-        help="Write traffic to PCAP file for Wireshark analysis",
+        help="Write all traffic to single PCAP file for Wireshark analysis",
+    ),
+    pcap_upstream: Optional[str] = typer.Option(
+        None,
+        "--pcap-upstream",
+        "-pu",
+        help="Write upstream traffic (Master<->Bridge) to PCAP file",
+    ),
+    pcap_downstream: Optional[str] = typer.Option(
+        None,
+        "--pcap-downstream",
+        "-pd",
+        help="Write downstream traffic (Bridge<->Slave) to PCAP file",
     ),
     script: Optional[list[str]] = typer.Option(
         None,
@@ -255,11 +267,29 @@ def start(
 
     # Set up PCAP logging if requested
     pcap_hook: Optional[PcapHook] = None
-    if pcap:
-        pcap_hook = PcapHook(pcap)
+    if pcap or pcap_upstream or pcap_downstream:
+        pcap_hook = PcapHook(
+            combined=pcap,
+            upstream=pcap_upstream,
+            downstream=pcap_downstream,
+        )
+        # Ingress captures upstream traffic (Master -> Bridge)
         bridge.pipeline.add_ingress_hook(pcap_hook.ingress_hook)
+        # Egress captures downstream traffic (Bridge -> Slave) - after transformations
+        bridge.pipeline.add_egress_hook(pcap_hook.egress_hook)
+        # Response hooks capture bidirectional traffic:
+        #   - response_hook: Slave -> Bridge (downstream inbound)
+        #   - upstream_response_hook: Bridge -> Master (upstream outbound)
         bridge.pipeline.add_response_hook(pcap_hook.response_hook)
-        console.print(f"[cyan]PCAP logging enabled: {pcap}[/cyan]")
+        bridge.pipeline.add_response_hook(pcap_hook.upstream_response_hook)
+
+        # Display PCAP configuration
+        if pcap:
+            console.print(f"[cyan]PCAP logging (combined): {pcap}[/cyan]")
+        if pcap_upstream:
+            console.print(f"[cyan]PCAP logging (upstream): {pcap_upstream}[/cyan]")
+        if pcap_downstream:
+            console.print(f"[cyan]PCAP logging (downstream): {pcap_downstream}[/cyan]")
 
     # Run bridge
     console.print(Panel.fit("[bold green]Starting bridge...[/bold green]"))
@@ -299,7 +329,13 @@ def start(
                     pcap_info = ""
                     if pcap_hook and pcap_hook.is_active:
                         pcap_stats = pcap_hook.stats
-                        pcap_info = f", {pcap_stats['packets']} packets logged"
+                        # Show stream breakdown if dual-stream enabled
+                        if "upstream" in pcap_stats or "downstream" in pcap_stats:
+                            up_pkts = pcap_stats.get("upstream", {}).get("packets", 0)
+                            dn_pkts = pcap_stats.get("downstream", {}).get("packets", 0)
+                            pcap_info = f", PCAP: ↑{up_pkts} ↓{dn_pkts} pkts"
+                        else:
+                            pcap_info = f", {pcap_stats['packets']} packets logged"
                     console.print(
                         f"[dim]Stats: {stats['requests_processed']} requests, "
                         f"{stats['upstream_clients']} clients{pcap_info}[/dim]"
@@ -331,7 +367,13 @@ def info() -> None:
             "  • TCP ↔ RTU protocol conversion (MBAP ↔ CRC framing)\n"
             "  • Multiple upstream client support with request queuing\n"
             "  • Python script injection for custom logic (--script)\n"
-            "  • PCAP traffic logging for Wireshark analysis (--pcap)\n\n"
+            "  • PCAP traffic logging for Wireshark analysis\n\n"
+            "[bold]PCAP Logging:[/bold]\n"
+            "  --pcap FILE           Combined traffic (legacy mode)\n"
+            "  --pcap-upstream FILE  Master ↔ Bridge traffic only\n"
+            "  --pcap-downstream FILE  Bridge ↔ Slave traffic only\n\n"
+            "  Dual-stream logging reveals what SCADA asked for vs.\n"
+            "  what was actually sent after script transformations.\n\n"
             "[bold]Script API:[/bold]\n"
             "  Scripts can define these hooks:\n"
             "  • on_request(req, ctx) - Intercept/modify/block requests\n"
