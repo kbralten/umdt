@@ -50,7 +50,7 @@ faults:
 
 transport:
   tcp_host: 0.0.0.0
-  tcp_port: 5020
+  tcp_port: 5021
 
 logging:
   level: INFO

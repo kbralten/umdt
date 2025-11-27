@@ -1,5 +1,10 @@
 # Docker Compose for UMDT E2E testing
-# Creates mock-server and cli containers on a shared network
+# Creates mock-server, bridge, and cli containers on a shared network
+#
+# Topology:
+#   cli -> bridge:5020 -> mock-server:5021
+#
+# The bridge proxies requests from port 5020 to mock-server on port 5021
 
 services:
   mock-server:
@@ -7,11 +12,39 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: umdt-mock-server
-    command: ["python", "mock_server_cli.py", "start", "--config", "/app/docker/e2e_config.yaml", "--tcp-host", "0.0.0.0", "--tcp-port", "5020"]
-    ports:
-      - "5020:5020"
+    command: ["python", "mock_server_cli.py", "start", "--config", "/app/docker/e2e_config.yaml", "--tcp-host", "0.0.0.0", "--tcp-port", "5021"]
+    expose:
+      - "5021"
     volumes:
       - ./docker:/app/docker:ro
+    networks:
+      - umdt-net
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s=socket.socket(); s.settimeout(1); s.connect(('localhost',5021)); s.close()"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile.bridge
+    container_name: umdt-bridge
+    command: 
+      - "start"
+      - "--upstream-host=0.0.0.0"
+      - "--upstream-port=5020"
+      - "--downstream-host=mock-server"
+      - "--downstream-port=5021"
+      - "--verbose"
+    ports:
+      - "5020:5020"
+    expose:
+      - "5020"
+    depends_on:
+      mock-server:
+        condition: service_healthy
     networks:
       - umdt-net
     healthcheck:
@@ -27,10 +60,12 @@ services:
       dockerfile: Dockerfile
     container_name: umdt-cli
     depends_on:
-      mock-server:
+      bridge:
         condition: service_healthy
     networks:
       - umdt-net
+    volumes:
+      - ./docker:/app/docker:ro
     # Keep container running for manual testing; E2E script runs separately
     command: ["sleep", "infinity"]
 

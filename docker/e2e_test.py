@@ -2,15 +2,21 @@
 """
 E2E test script for UMDT Docker containers.
 
-Runs a series of CLI commands against the mock server and validates results.
+Runs a series of CLI commands against the mock server (via bridge) and validates results.
 Exit code 0 = all tests passed, non-zero = failures.
 
-Usage:
-    # From host (containers must be running):
-    python docker/e2e_test.py --host localhost --port 5020
+Topology:
+    cli -> bridge:5020 -> mock-server:5021
 
-    # Or run inside the cli container:
-    python docker/e2e_test.py --host mock-server --port 5020
+Usage:
+    # Test via bridge (default E2E path):
+    python docker/e2e_test.py --host bridge --port 5020
+
+    # Test direct to mock-server (bypass bridge):
+    python docker/e2e_test.py --host mock-server --port 5021 --direct
+
+    # From host machine with exposed ports:
+    python docker/e2e_test.py --host localhost --port 5020
 """
 
 import argparse
@@ -170,17 +176,93 @@ def test_decode_command(host: str, port: int) -> bool:
     return True
 
 
+def test_bridge_passthrough(host: str, port: int) -> bool:
+    """Test that bridge correctly proxies requests to mock server.
+    
+    This test verifies the full E2E path:
+      cli -> bridge -> mock-server -> bridge -> cli
+    """
+    print("\n[TEST] Bridge passthrough (full E2E path)...")
+    
+    # Write a unique value via bridge, read it back
+    test_addr = 15
+    test_value = 31337  # "elite" number for easy identification
+    
+    # Write through bridge
+    code, stdout, stderr = run_cli(
+        ["write", "--address", str(test_addr), str(test_value)],
+        host, port
+    )
+    if code != 0:
+        print(f"  FAIL: write via bridge failed (exit={code})")
+        print(f"  stderr: {stderr}")
+        return False
+    
+    print(f"  Wrote {test_value} to register {test_addr} via bridge")
+    
+    # Read back through bridge
+    code, stdout, stderr = run_cli(
+        ["read", "--address", str(test_addr), "--count", "1"],
+        host, port
+    )
+    if code != 0:
+        print(f"  FAIL: read via bridge failed (exit={code})")
+        print(f"  stderr: {stderr}")
+        return False
+    
+    if str(test_value) not in stdout:
+        print(f"  FAIL: expected {test_value} not found in readback")
+        print(f"  stdout: {stdout}")
+        return False
+    
+    print(f"  PASS: Successfully read {test_value} via bridge")
+    return True
+
+
+def test_bridge_multiple_requests(host: str, port: int) -> bool:
+    """Test multiple sequential requests through bridge."""
+    print("\n[TEST] Bridge multiple sequential requests...")
+    
+    success_count = 0
+    total_requests = 5
+    
+    for i in range(total_requests):
+        addr = 10 + i
+        code, stdout, stderr = run_cli(
+            ["read", "--address", str(addr), "--count", "1"],
+            host, port
+        )
+        if code == 0:
+            success_count += 1
+        else:
+            print(f"  Request {i+1}/{total_requests} failed: {stderr}")
+    
+    if success_count != total_requests:
+        print(f"  FAIL: Only {success_count}/{total_requests} requests succeeded")
+        return False
+    
+    print(f"  PASS: All {total_requests} sequential requests succeeded")
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser(description="UMDT E2E Test Runner")
-    parser.add_argument("--host", default="localhost", help="Mock server host")
-    parser.add_argument("--port", type=int, default=5020, help="Mock server port")
+    parser.add_argument("--host", default="bridge", help="Target host (bridge or mock-server)")
+    parser.add_argument("--port", type=int, default=5020, help="Target port")
+    parser.add_argument("--direct", action="store_true", 
+                        help="Test direct to mock-server (skip bridge tests)")
     args = parser.parse_args()
     
     print("=" * 60)
     print("UMDT End-to-End Test Suite")
     print(f"Target: {args.host}:{args.port}")
+    if not args.direct:
+        print("Mode: Via Bridge (full E2E path)")
+    else:
+        print("Mode: Direct to Mock Server")
     print("=" * 60)
     
+    # Core tests run against any target
     tests = [
         ("Read frozen registers", test_read_frozen_registers),
         ("Write and read back", test_write_and_read_back),
@@ -188,6 +270,13 @@ def main():
         ("Read coils", test_read_coils),
         ("Decode command", test_decode_command),
     ]
+    
+    # Bridge-specific tests only when not in direct mode
+    if not args.direct:
+        tests.extend([
+            ("Bridge passthrough", test_bridge_passthrough),
+            ("Bridge multiple requests", test_bridge_multiple_requests),
+        ])
     
     passed = 0
     failed = 0
