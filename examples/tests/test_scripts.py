@@ -1,5 +1,4 @@
 import asyncio
-import types
 import random
 import pytest
 
@@ -95,7 +94,7 @@ async def test_fault_injector_drop_and_delay(monkeypatch):
     monkeypatch.setattr(ctx, 'sleep', fake_sleep)
 
     res2 = await fault_injector.on_request(req, ctx)
-    assert res2 is None
+    assert res2 is req  # Returns the request unchanged (pass through with delay)
     assert len(sleeps) == 1
 
 

@@ -38,11 +38,9 @@ Example scripts:
 """
 from __future__ import annotations
 
-import asyncio
 import logging
-import struct
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, Optional, Union
 
 from umdt.core.script_engine import (
     ExceptionResponse,

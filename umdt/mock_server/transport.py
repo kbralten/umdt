@@ -299,7 +299,7 @@ class TransportCoordinator:
         self._pcap_writer: Optional[PcapWriter] = None
         self._pcap_path = Path(pcap_path) if pcap_path else None
         self._script_hook: Optional[MockServerScriptHook] = None
-        
+
         # Load scripts if provided
         if scripts:
             self._script_hook = MockServerScriptHook(scripts=scripts, name="mock_server")

@@ -213,6 +213,7 @@ class MockServerScriptHook:
             try:
                 await self._periodic_task
             except asyncio.CancelledError:
+                # Expected when cancelling the periodic task; safe to ignore.
                 pass
             self._periodic_task = None
             logger.info("Periodic hooks stopped")
