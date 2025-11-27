@@ -1,0 +1,44 @@
+# UMDT Bridge Docker image
+# Provides the Modbus protocol bridge (TCP <-> RTU conversion)
+FROM python:3.13-slim
+
+LABEL maintainer="UMDT Project"
+LABEL description="UMDT Bridge - Modbus Protocol Soft-Gateway"
+
+# Install system dependencies (minimal for bridge)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy requirements first for better layer caching
+COPY requirements.txt .
+
+# Install Python dependencies needed for bridge
+# (skip PySide6/GUI packages - not needed for bridge)
+RUN pip install --no-cache-dir \
+    typer \
+    pymodbus \
+    rich \
+    pyserial \
+    pyserial-asyncio
+
+# Copy application code
+COPY umdt/ ./umdt/
+COPY bridge.py .
+
+# Copy example scripts (optional)
+COPY examples/ ./examples/
+
+# Default ports:
+#   502  - Modbus TCP standard
+#   5020 - Alternate upstream port
+EXPOSE 502 5020
+
+# Health check - verify bridge module imports correctly
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD python -c "from umdt.bridge import Bridge; print('OK')" || exit 1
+
+# Default entrypoint: run bridge with provided arguments
+ENTRYPOINT ["python", "bridge.py"]
+CMD ["info"]

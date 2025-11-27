@@ -50,6 +50,7 @@ jobs:
         run: |
           ls -la docker || true
           chmod +x docker/run_e2e.sh || true
+          chmod +x docker/run_scripting_e2e.sh || true          
 
       - name: Run Docker E2E script
         env:
@@ -58,6 +59,14 @@ jobs:
           set -e
           # Run the project's E2E script which builds the images, starts the mock server, runs tests, and tears down
           bash docker/run_e2e.sh
+
+      - name: Run Scripting E2E tests
+        env:
+          COMPOSE_HTTP_TIMEOUT: 200
+        run: |
+          set -e
+          # Run E2E tests with scripting enabled (bridge interlock + mock server counter)
+          bash docker/run_scripting_e2e.sh
 
   ui-tests:
     name: UI Tests with Mock Server (Windows)

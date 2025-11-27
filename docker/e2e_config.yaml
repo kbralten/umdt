@@ -1,13 +1,35 @@
 # E2E test configuration for mock Modbus server
-# Minimal config with predictable values for validation
+# Extended config for scripting E2E tests with predictable values
 
 unit_id: 1
 
 groups:
+  # Basic registers (0-19)
   - name: test_holdings
     type: holding
     start: 0
     length: 20
+    writable: true
+
+  # System status and motor control registers (50-200)
+  - name: interlock_registers
+    type: holding
+    start: 50
+    length: 160
+    writable: true
+
+  # Extended test area (500-600)
+  - name: extended_holdings
+    type: holding
+    start: 500
+    length: 100
+    writable: true
+
+  # Protected range for counter script (1000-1100)
+  - name: protected_range
+    type: holding
+    start: 1000
+    length: 101
     writable: true
 
   - name: test_inputs
@@ -38,6 +60,10 @@ rules:
   "1":
     mode: frozen-value
     forced_value: 43981
+  # System status register at 50: start with STATUS_READY (1)
+  "50":
+    mode: frozen-value
+    forced_value: 1
 
 scripts: []
 
@@ -50,7 +76,7 @@ faults:
 
 transport:
   tcp_host: 0.0.0.0
-  tcp_port: 5020
+  tcp_port: 5021
 
 logging:
   level: INFO

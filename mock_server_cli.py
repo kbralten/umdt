@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import typer
 from rich.console import Console
@@ -158,12 +158,14 @@ async def _interactive_console(device: MockDevice) -> None:
         console.print(f"Unknown command: {raw}")
 
 
-async def _run_server(config_path: Path, tcp_host: Optional[str], tcp_port: int, serial_port: Optional[str], serial_baud: int, interactive: bool, pcap_path: Optional[Path] = None) -> None:
+async def _run_server(config_path: Path, tcp_host: Optional[str], tcp_port: int, serial_port: Optional[str], serial_baud: int, interactive: bool, pcap_path: Optional[Path] = None, scripts: Optional[List[Path]] = None) -> None:
     cfg = load_config(config_path)
     device = MockDevice(cfg)
-    coordinator = TransportCoordinator(device, unit_id=cfg.unit_id, pcap_path=pcap_path)
+    coordinator = TransportCoordinator(device, unit_id=cfg.unit_id, pcap_path=pcap_path, scripts=scripts)
     if pcap_path:
         console.print(f"[yellow]PCAP logging enabled: {pcap_path}[/]")
+    if scripts:
+        console.print(f"[yellow]Loaded {len(scripts)} script(s) for logic injection[/]")
     async def _event_printer(dev: MockDevice) -> None:
         try:
             while True:
@@ -212,12 +214,13 @@ def start(
     serial_baud: int = typer.Option(9600, help="Serial baudrate"),
     interactive: bool = typer.Option(False, help="Launch interactive console for runtime control"),
     pcap: Optional[Path] = typer.Option(None, help="Path to PCAP file for traffic capture"),
+    script: Optional[List[Path]] = typer.Option(None, "--script", "-s", help="Python script file(s) for logic injection (can be repeated)"),
 ):
     """Start the mock server over TCP or serial."""
 
     _ensure_transport_args(tcp_host, tcp_port, serial_port)
     try:
-        asyncio.run(_run_server(config, tcp_host, tcp_port, serial_port, serial_baud, interactive, pcap))
+        asyncio.run(_run_server(config, tcp_host, tcp_port, serial_port, serial_baud, interactive, pcap, script))
     except KeyboardInterrupt:
         console.print("Stopping server...")
 
