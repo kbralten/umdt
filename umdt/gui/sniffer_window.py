@@ -5,7 +5,7 @@ from typing import List, Dict, Any, Optional
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QComboBox, 
     QPushButton, QTableView, QSplitter, QHeaderView, QTextEdit,
-    QLabel, QAbstractItemView, QMessageBox
+    QLabel, QAbstractItemView, QMessageBox, QCheckBox, QFileDialog
 )
 from PySide6.QtCore import Qt, QAbstractTableModel, Signal, QObject, QModelIndex
 from PySide6.QtGui import QColor, QFont, QBrush
@@ -148,6 +148,10 @@ class SnifferWindow(QMainWindow):
         # self.btn_start.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
         control_layout.addWidget(self.btn_start)
         
+        self.chk_pcap = QCheckBox("PCAP")
+        self.chk_pcap.setToolTip("Save traffic to .pcap file")
+        control_layout.addWidget(self.chk_pcap)
+        
         self.btn_clear = QPushButton("Clear")
         self.btn_clear.clicked.connect(self.clear_log)
         control_layout.addWidget(self.btn_clear)
@@ -224,10 +228,22 @@ class SnifferWindow(QMainWindow):
         except ValueError:
             QMessageBox.warning(self, "Invalid Baud", "Baud rate must be an integer.")
             return
+            
+        # Handle PCAP selection
+        pcap_path = None
+        if self.chk_pcap.isChecked():
+            default_name = f"capture_{int(time.time())}.pcap"
+            file_path, _ = QFileDialog.getSaveFileName(
+                self, "Save PCAP Capture", default_name, "PCAP Files (*.pcap);;All Files (*)"
+            )
+            if not file_path:
+                return # Cancelled
+            pcap_path = file_path
 
         # Lock controls
         self.combo_port.setEnabled(False)
         self.combo_baud.setEnabled(False)
+        self.chk_pcap.setEnabled(False)
         self.btn_start.setText("Stop Sniffing")
         # self.btn_start.setStyleSheet("background-color: #F44336; color: white; font-weight: bold;")
         
@@ -238,7 +254,8 @@ class SnifferWindow(QMainWindow):
         # (even though qasync runs in same thread, good practice to decouple)
         self.sniffer = Sniffer(
             port=port, 
-            baudrate=baud, 
+            baudrate=baud,
+            pcap_path=pcap_path,
             on_frame=lambda f: self.packet_received.emit(f)
         )
         
@@ -258,6 +275,7 @@ class SnifferWindow(QMainWindow):
         # Unlock controls
         self.combo_port.setEnabled(True)
         self.combo_baud.setEnabled(True)
+        self.chk_pcap.setEnabled(True)
         self.btn_start.setText("Start Sniffing")
         # self.btn_start.setStyleSheet("") # reset style
 

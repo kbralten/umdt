@@ -6,6 +6,7 @@ from typing import Optional, List, Dict, Any, Callable
 from umdt.transports.serial_async import SerialTransport
 from umdt.transports.passive import PassiveTransport
 from umdt.database.logging import DBLogger
+from umdt.core.pcap import PcapWriter, Direction
 
 # Try to import CRC utils
 try:
@@ -153,7 +154,14 @@ class SlidingWindowDecoder:
         return frames
 
 class Sniffer:
-    def __init__(self, port: str, baudrate: int = 9600, db_path: Optional[str] = None, on_frame: Optional[Callable[[Dict[str, Any]], None]] = None):
+    def __init__(
+        self, 
+        port: str, 
+        baudrate: int = 9600, 
+        db_path: Optional[str] = None, 
+        pcap_path: Optional[str] = None,
+        on_frame: Optional[Callable[[Dict[str, Any]], None]] = None
+    ):
         self.port = port
         self.baudrate = baudrate
         # Initialize Transport
@@ -163,6 +171,12 @@ class Sniffer:
         # Initialize Logger
         self.logger = DBLogger(db_path=db_path)
         
+        # Initialize PCAP Writer
+        self.pcap_path = pcap_path
+        self.pcap_writer: Optional[PcapWriter] = None
+        if pcap_path:
+            self.pcap_writer = PcapWriter(pcap_path)
+
         # Initialize Decoder
         self.decoder = SlidingWindowDecoder()
         
@@ -172,6 +186,9 @@ class Sniffer:
 
     async def start(self):
         await self.logger.start()
+        if self.pcap_writer:
+            self.pcap_writer.open()
+            
         await self.transport.connect()
         self.running = True
         self._task = asyncio.create_task(self._run_loop())
@@ -187,6 +204,12 @@ class Sniffer:
                 pass
         await self.transport.disconnect()
         await self.logger.stop()
+        
+        if self.pcap_writer:
+            # Ensure all writes are flushed
+            await self.pcap_writer.flush_async()
+            self.pcap_writer.close()
+            
         logger.info("Sniffer stopped")
 
     async def _run_loop(self):
@@ -213,6 +236,15 @@ class Sniffer:
                         "parsed_json": None # TODO: Add deep decoding later
                     })
                     
+                    # Log to PCAP if enabled
+                    if self.pcap_writer:
+                        await self.pcap_writer.write_packet_async(
+                            data=frame['raw'],
+                            direction=Direction.UNKNOWN,
+                            protocol=PcapWriter.PROTO_MODBUS_RTU,
+                            timestamp=frame['timestamp']
+                        )
+                    
                     if self.on_frame:
                         try:
                             self.on_frame(frame)
@@ -230,3 +262,4 @@ class Sniffer:
                     await asyncio.sleep(0.1)
                 except (RuntimeError, asyncio.CancelledError):
                     break
+

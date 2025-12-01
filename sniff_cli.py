@@ -20,6 +20,7 @@ def sniff(
     serial: str = typer.Argument(..., help="Serial port (e.g. COM5)"),
     baud: int = typer.Option(9600, help="Baud rate"),
     output: Optional[str] = typer.Option(None, "--output", "-o", help="Output database file (default: umdt_traffic.db)"),
+    pcap: Optional[str] = typer.Option(None, "--pcap", "-p", help="Output PCAP file (default: None)"),
 ):
     """Passive sniffer for Modbus RTU traffic.
 
@@ -34,6 +35,8 @@ def sniff(
     sp = normalize_serial_port(serial)
     
     console.print(f"[bold green]Starting Sniffer on {sp} @ {baud} baud...[/bold green]")
+    if pcap:
+        console.print(f"[bold blue]PCAP export enabled: {pcap}[/bold blue]")
     console.print("Press Ctrl-C to stop.")
     
     def print_frame(frame):
@@ -46,7 +49,7 @@ def sniff(
         desc = f"Slave {slave} FC {fc}"
         console.print(f"[{time.strftime('%H:%M:%S', time.localtime(ts))}] {desc:<15} | {hex_str}")
 
-    sniffer = Sniffer(port=sp, baudrate=baud, db_path=output, on_frame=print_frame)
+    sniffer = Sniffer(port=sp, baudrate=baud, db_path=output, pcap_path=pcap, on_frame=print_frame)
     
     async def run_sniffer():
         await sniffer.start()
