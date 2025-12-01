@@ -5,12 +5,15 @@ from typing import List, Dict, Any, Optional
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QComboBox, 
     QPushButton, QTableView, QSplitter, QHeaderView, QTextEdit,
-    QLabel, QAbstractItemView, QMessageBox, QCheckBox, QFileDialog
+    QLabel, QAbstractItemView, QMessageBox, QCheckBox, QFileDialog,
+    QTabWidget
 )
 from PySide6.QtCore import Qt, QAbstractTableModel, Signal, QObject, QModelIndex
 from PySide6.QtGui import QColor, QFont, QBrush
 
 from umdt.core.sniffer import Sniffer
+from umdt.core.analyzer import TrafficAnalyzer, StateUpdate
+
 try:
     from serial.tools import list_ports
 except ImportError:
@@ -95,6 +98,89 @@ class PacketTableModel(QAbstractTableModel):
         self.endResetModel()
 
 
+class StateMapModel(QAbstractTableModel):
+    """Model for the state map (shadow registers)."""
+    
+    COLUMNS = ["Slave", "Type", "Address", "Value (Dec)", "Value (Hex)", "Last Updated"]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # Key: (slave_id, data_type, address) -> StateUpdate
+        self._data_map: Dict[tuple, StateUpdate] = {}
+        # List of keys for row mapping
+        self._keys: List[tuple] = []
+
+    def rowCount(self, parent=QModelIndex()):
+        return len(self._keys)
+
+    def columnCount(self, parent=QModelIndex()):
+        return len(self.COLUMNS)
+
+    def data(self, index, role=Qt.DisplayRole):
+        if not index.isValid() or not (0 <= index.row() < len(self._keys)):
+            return None
+        
+        key = self._keys[index.row()]
+        item = self._data_map[key]
+        col = index.column()
+
+        if role == Qt.DisplayRole:
+            if col == 0: return str(item.slave_id)
+            elif col == 1: return item.data_type
+            elif col == 2: return str(item.address)
+            elif col == 3: return str(int(item.value))
+            elif col == 4:
+                try:
+                    return f"0x{int(item.value):X}"
+                except Exception:
+                    return str(item.value)
+            elif col == 5:
+                dt = datetime.datetime.fromtimestamp(item.timestamp)
+                return dt.strftime("%H:%M:%S.%f")[:-3]
+        
+        elif role == Qt.TextAlignmentRole:
+            if col in (0, 2, 3, 4):
+                return Qt.AlignCenter
+            return Qt.AlignLeft | Qt.AlignVCenter
+
+        return None
+
+    def headerData(self, section, orientation, role=Qt.DisplayRole):
+        if role == Qt.DisplayRole and orientation == Qt.Horizontal:
+            return self.COLUMNS[section]
+        return None
+
+    def update_state(self, updates: List[StateUpdate]):
+        if not updates:
+            return
+            
+        # Check for new keys
+        new_keys = []
+        for u in updates:
+            key = (u.slave_id, u.data_type, u.address)
+            if key not in self._data_map:
+                new_keys.append(key)
+            self._data_map[key] = u
+            
+        if new_keys:
+            self.beginResetModel()
+            self._keys.extend(new_keys)
+            # Sort keys for display stability (Slave, Type, Addr)
+            self._keys.sort(key=lambda k: (k[0], k[1], k[2]))
+            self.endResetModel()
+        else:
+            # Emit change for existing rows
+            # For simplicity, just refresh whole table to show updated values
+            if self._keys:
+                self.dataChanged.emit(self.index(0, 0), self.index(len(self._keys)-1, 5))
+
+    def clear(self):
+        self.beginResetModel()
+        self._data_map.clear()
+        self._keys.clear()
+        self.endResetModel()
+
+
 class SnifferWindow(QMainWindow):
     # Signal to bridge async callback to GUI thread
     packet_received = Signal(dict)
@@ -106,6 +192,8 @@ class SnifferWindow(QMainWindow):
 
         self.sniffer: Optional[Sniffer] = None
         self.is_running = False
+        
+        self.analyzer = TrafficAnalyzer()
 
         self.setup_ui()
         self.refresh_ports()
@@ -159,9 +247,17 @@ class SnifferWindow(QMainWindow):
         control_layout.addStretch()
         main_layout.addLayout(control_layout)
 
-        # --- Splitter (Table + Details) ---
+        # --- Tabs ---
+        self.tabs = QTabWidget()
+        main_layout.addWidget(self.tabs)
+
+        # Tab 1: Packet Log
+        self.tab_log = QWidget()
+        log_layout = QVBoxLayout(self.tab_log)
+        log_layout.setContentsMargins(0, 0, 0, 0)
+        
         splitter = QSplitter(Qt.Vertical)
-        main_layout.addWidget(splitter)
+        log_layout.addWidget(splitter)
 
         # 1. Traffic Table
         self.table_view = QTableView()
@@ -172,10 +268,6 @@ class SnifferWindow(QMainWindow):
         self.table_view.verticalHeader().setVisible(False)
         self.table_view.horizontalHeader().setSectionResizeMode(5, QHeaderView.Stretch) # Stretch info col
         self.table_view.selectionModel().selectionChanged.connect(self.on_selection_changed)
-        
-        # Font setup for table (monospace for hex ideally, but standard is fine)
-        # font = QFont("Consolas", 9)
-        # self.table_view.setFont(font)
         
         splitter.addWidget(self.table_view)
 
@@ -194,9 +286,24 @@ class SnifferWindow(QMainWindow):
         details_layout.addWidget(self.txt_details)
         
         splitter.addWidget(details_widget)
-        
-        # Set initial splitter sizes
         splitter.setSizes([400, 200])
+        
+        self.tabs.addTab(self.tab_log, "Packet Log")
+
+        # Tab 2: State Map
+        self.tab_state = QWidget()
+        state_layout = QVBoxLayout(self.tab_state)
+        
+        self.state_table = QTableView()
+        self.state_model = StateMapModel()
+        self.state_table.setModel(self.state_model)
+        self.state_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.state_table.verticalHeader().setVisible(False)
+        self.state_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.state_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.Stretch)
+        
+        state_layout.addWidget(self.state_table)
+        self.tabs.addTab(self.tab_state, "State Map")
 
     def refresh_ports(self):
         self.combo_port.clear()
@@ -250,8 +357,6 @@ class SnifferWindow(QMainWindow):
         self.is_running = True
         
         # Init Sniffer
-        # We pass a lambda that emits the QT signal to be thread-safe 
-        # (even though qasync runs in same thread, good practice to decouple)
         self.sniffer = Sniffer(
             port=port, 
             baudrate=baud,
@@ -303,12 +408,22 @@ class SnifferWindow(QMainWindow):
 
     def clear_log(self):
         self.model.clear()
+        self.state_model.clear()
         self.txt_details.clear()
+        # Clear analyzer state too
+        self.analyzer = TrafficAnalyzer()
 
     def on_packet_received(self, frame: dict):
+        # Update Log
         self.model.add_packet(frame)
         # Auto-scroll if at bottom? 
-        self.table_view.scrollToBottom()
+        if self.table_view.verticalScrollBar().value() == self.table_view.verticalScrollBar().maximum():
+            self.table_view.scrollToBottom()
+            
+        # Analyze for State Map
+        updates = self.analyzer.process_packet(frame)
+        if updates:
+            self.state_model.update_state(updates)
 
     def on_selection_changed(self, selected, deselected):
         indexes = self.table_view.selectionModel().selectedRows()
