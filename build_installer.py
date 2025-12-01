@@ -27,6 +27,8 @@ CLI_EXE = os.path.join(DIST, "umdt.exe")
 GUI_EXE = os.path.join(DIST, "umdt_gui.exe")
 MOCK_CLI_EXE = os.path.join(DIST, "umdt_mock.exe")
 MOCK_GUI_EXE = os.path.join(DIST, "umdt_mock_server_gui.exe")
+SNIFF_CLI_EXE = os.path.join(DIST, "umdt_sniff.exe")
+SNIFF_GUI_EXE = os.path.join(DIST, "umdt_sniff_gui.exe")
 LICENSE_SRC = os.path.join(ROOT, "LICENSE")
 
 ISS_PATH = os.path.join(BUILD, "umdt_installer.iss")
@@ -39,7 +41,7 @@ APP_VERSION = "0.1.0"
 
 def gather_sources():
     missing = []
-    for p in (CLI_EXE, GUI_EXE, MOCK_CLI_EXE, MOCK_GUI_EXE):
+    for p in (CLI_EXE, GUI_EXE, MOCK_CLI_EXE, MOCK_GUI_EXE, SNIFF_CLI_EXE, SNIFF_GUI_EXE):
         if not os.path.exists(p):
             missing.append(p)
     return missing
@@ -64,8 +66,11 @@ Source: "{CLI}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{GUI}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{MOCK_CLI}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{MOCK_GUI}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{SNIFF_CLI}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{SNIFF_GUI}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{ICON}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{MOCK_ICON}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{SNIFF_ICON}"; DestDir: "{app}"; Flags: ignoreversion
 
 [Tasks]
 Name: addtopath; Description: "Add UMDT install directory to the user PATH"; GroupDescription: "Additional tasks:"; Flags: unchecked
@@ -75,11 +80,14 @@ Name: "{group}\UMDT GUI"; Filename: "{app}\{GUI_BASENAME}"; IconFilename: "{app}
 Name: "{group}\UMDT CLI (Console)"; Filename: "{app}\{CLI_BASENAME}"; IconFilename: "{app}\{ICON_BASENAME}"
 Name: "{group}\UMDT Mock Server GUI"; Filename: "{app}\{MOCK_GUI_BASENAME}"; IconFilename: "{app}\{MOCK_ICON_BASENAME}"
 Name: "{group}\UMDT Mock Server CLI"; Filename: "{app}\{MOCK_CLI_BASENAME}"; IconFilename: "{app}\{ICON_BASENAME}"
+Name: "{group}\UMDT Sniffer GUI"; Filename: "{app}\{SNIFF_GUI_BASENAME}"; IconFilename: "{app}\{SNIFF_ICON_BASENAME}"
+Name: "{group}\UMDT Sniffer CLI"; Filename: "{app}\{SNIFF_CLI_BASENAME}"; IconFilename: "{app}\{SNIFF_ICON_BASENAME}"
 
 [Run]
 ; Launch the GUI after install
 Filename: "{app}\\{GUI_BASENAME}"; Description: "Launch UMDT GUI"; Flags: nowait postinstall skipifsilent
 Filename: "{app}\\{MOCK_GUI_BASENAME}"; Description: "Launch Mock Server GUI"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\\{SNIFF_GUI_BASENAME}"; Description: "Launch Sniffer GUI"; Flags: nowait postinstall skipifsilent
 
 [Registry]
 ; If the user selected the Add to PATH task, append the install dir to the user PATH (HKCU). Note: user will need to re-login to pick up new PATH.
@@ -94,14 +102,23 @@ Root: HKCU; Subkey: "Environment"; ValueType: string; ValueName: "PATH"; ValueDa
     # Attempt to include mock server executables if present in dist
     content = content.replace("{MOCK_CLI}", os.path.join(DIST, os.path.basename(MOCK_CLI_EXE)))
     content = content.replace("{MOCK_GUI}", os.path.join(DIST, os.path.basename(MOCK_GUI_EXE)))
-    # Include mock icon path for mock GUI shortcut if present
+    content = content.replace("{SNIFF_CLI}", os.path.join(DIST, os.path.basename(SNIFF_CLI_EXE)))
+    content = content.replace("{SNIFF_GUI}", os.path.join(DIST, os.path.basename(SNIFF_GUI_EXE)))
+    
+    # Icons
     content = content.replace("{MOCK_ICON}", os.path.join(ROOT, "umdt_mock.ico"))
     content = content.replace("{MOCK_ICON_BASENAME}", os.path.basename(os.path.join(ROOT, "umdt_mock.ico")))
+    content = content.replace("{SNIFF_ICON}", os.path.join(ROOT, "umdt-sniff.ico"))
+    content = content.replace("{SNIFF_ICON_BASENAME}", os.path.basename(os.path.join(ROOT, "umdt-sniff.ico")))
+    
     content = content.replace("{LICENSE}", LICENSE_SRC)
     content = content.replace("{CLI_BASENAME}", os.path.basename(cli_path))
     content = content.replace("{GUI_BASENAME}", os.path.basename(gui_path))
     content = content.replace("{MOCK_CLI_BASENAME}", os.path.basename(MOCK_CLI_EXE))
     content = content.replace("{MOCK_GUI_BASENAME}", os.path.basename(MOCK_GUI_EXE))
+    content = content.replace("{SNIFF_CLI_BASENAME}", os.path.basename(SNIFF_CLI_EXE))
+    content = content.replace("{SNIFF_GUI_BASENAME}", os.path.basename(SNIFF_GUI_EXE))
+    
     content = content.replace("{ICON}", os.path.join(ROOT, "umdt.ico"))
     content = content.replace("{ICON_BASENAME}", os.path.basename(os.path.join(ROOT, "umdt.ico")))
     # Ensure lowercase {icon} placeholder (used in template) is also replaced
@@ -187,8 +204,8 @@ def main():
         print("https://jrsoftware.org/isinfo.php")
 
     print("Creating ZIP fallback with exes and script...")
-    files = [CLI_EXE, GUI_EXE, MOCK_CLI_EXE, MOCK_GUI_EXE]
-    extras = [ISS_PATH, os.path.join(ROOT, "umdt.ico"), os.path.join(ROOT, "umdt_mock.ico")]
+    files = [CLI_EXE, GUI_EXE, MOCK_CLI_EXE, MOCK_GUI_EXE, SNIFF_CLI_EXE, SNIFF_GUI_EXE]
+    extras = [ISS_PATH, os.path.join(ROOT, "umdt.ico"), os.path.join(ROOT, "umdt_mock.ico"), os.path.join(ROOT, "umdt-sniff.ico")]
     z = make_zip(files, extras)
     print("Created:", z)
     print("Done. If you want a native installer, install Inno Setup and re-run this script.")
