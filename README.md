@@ -283,3 +283,47 @@ pip install -r requirements-dev.txt
 pytest tests/ui -q
 ```
 - Notes: Running GUI tests on headless CI typically requires an X server or virtual framebuffer (e.g., `xvfb`) or using a Windows-native test runner. For quick local iteration on Windows, run tests directly in the desktop session.
+
+## 4. Sniff (Traffic Capture)
+
+UMDT includes lightweight "sniff" programs for capturing and inspecting Modbus traffic from TCP or serial/RTU transports. There are both CLI and GUI frontends:
+
+- CLI: `sniff_cli.py` — command-line packet capture and on-disk PCAP writer.
+- GUI: `sniff_gui.py` — a small PySide6 front-end for live capture, playback, and quick decoding.
+
+Purpose:
+- Capture Modbus conversations for forensic analysis, debugging, and replay.
+- Produce PCAP files compatible with the UMDT Wireshark Lua wrapper (see above) so Modbus frames decode cleanly in Wireshark.
+
+Common features:
+- Capture from a TCP endpoint (host:port) or a serial device (COM/tty, baud rate).
+- Save captures to PCAP, with the same UMDT 4-byte metadata header (direction, protocol hint) used by the bridge.
+- Optionally split upstream/downstream streams into separate files for easier analysis.
+- Live decoding using the built-in simple displayer (CLI) or the GUI's live view.
+
+Quick CLI usage examples:
+```powershell
+# Capture TCP traffic and write a single pcap
+python sniff_cli.py capture --host 192.168.1.10 --port 502 --output capture.pcap
+
+# Capture serial/RTU traffic on COM3 at 115200
+python sniff_cli.py capture --serial COM3 --baud 115200 --output rtu_capture.pcap
+
+# Capture split streams (upstream/downstream)
+python sniff_cli.py capture --host 127.0.0.1 --port 5503 --split --out-up upstream.pcap --out-down downstream.pcap
+```
+
+GUI:
+- Launch with: `python sniff_gui.py`
+- The GUI offers: Start/Stop capture, file naming, basic live decoding, and an option to open captures in Wireshark with the UMDT Lua wrapper.
+
+Building the sniff binaries with PyInstaller:
+- `build_dist.py` will produce `umdt_sniff` and `umdt_sniff_gui` if the corresponding entry points exist. Run:
+```powershell
+python build_dist.py
+```
+and look for `umdt_sniff` / `umdt_sniff_gui` in `./dist/`.
+
+Notes & tips:
+- Use the Wireshark wrapper scripts (`umdt_modbus_wrapper.lua` + `umdt_mbap.lua`) to decode the PCAPs produced by the sniff tools.
+- When capturing RTU frames, ensure the sniff tool or the environment exposes the serial line in raw mode so CRCs are preserved for the wrapper to strip appropriately.
