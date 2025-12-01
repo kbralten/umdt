@@ -93,9 +93,12 @@ function p_umdt.dissector(tvbuf, pktinfo, root)
   if dir == 1 then
     pktinfo.cols.src = "client"
     pktinfo.cols.dst = "server"
-  else
+  elseif dir == 2 then
     pktinfo.cols.src = "server"
     pktinfo.cols.dst = "client"
+  else -- dir == 0 (UNKNOWN) or any other unexpected value
+    pktinfo.cols.src = "unknown"
+    pktinfo.cols.dst = "unknown"
   end
 
   local data_dissector = Dissector.get("data")
