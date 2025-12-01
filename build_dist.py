@@ -39,6 +39,7 @@ def build(cli_name: str = "umdt", gui_name: str = "umdt_gui"):
     cli_entry = os.path.join(ROOT, "main_cli.py")
     gui_entry = os.path.join(ROOT, "main_gui.py")
     mock_cli_entry = os.path.join(ROOT, "mock_server_cli.py")
+    bridge_entry = os.path.join(ROOT, "bridge.py")
     mock_gui_entry = os.path.join(ROOT, "mock_server_gui.py")
     sniff_cli_entry = os.path.join(ROOT, "sniff_cli.py")
     sniff_gui_entry = os.path.join(ROOT, "sniff_gui.py")
@@ -51,6 +52,14 @@ def build(cli_name: str = "umdt", gui_name: str = "umdt_gui"):
 
     print("Building CLI executable (console)...")
     subprocess.check_call(common_args + ["--name", cli_name, cli_entry])
+
+    # Build bridge CLI
+    if os.path.exists(bridge_entry):
+        bridge_name = "umdt_bridge"
+        print("Building bridge CLI executable (console)...")
+        subprocess.check_call(common_args + ["--name", bridge_name, bridge_entry])
+    else:
+        print("Skipping bridge CLI: entry not found")
 
     # Build mock server CLI
     if os.path.exists(mock_cli_entry):
