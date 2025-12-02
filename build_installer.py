@@ -56,7 +56,7 @@ PrivilegesRequired=lowest
 AppName={app_name}
 AppVersion={app_version}
 SetupIconFile={icon}
-DefaultDirName={commonpf}\UMDT
+DefaultDirName={autopf}\UMDT
 DefaultGroupName=UMDT
 OutputBaseFilename={out_name}
 Compression=lzma
@@ -88,10 +88,7 @@ Name: "{group}\UMDT Bridge CLI"; Filename: "{app}\{BRIDGE_BASENAME}"; IconFilena
 
 [Run]
 ; Launch the GUI after install
-Filename: "{app}\\{GUI_BASENAME}"; Description: "Launch UMDT GUI"; Flags: nowait postinstall skipifsilent
-Filename: "{app}\\{MOCK_GUI_BASENAME}"; Description: "Launch Mock Server GUI"; Flags: nowait postinstall skipifsilent
-Filename: "{app}\\{SNIFF_GUI_BASENAME}"; Description: "Launch Sniffer GUI"; Flags: nowait postinstall skipifsilent
-Filename: "{app}\\{BRIDGE_BASENAME}"; Description: "Launch Bridge CLI"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{GUI_BASENAME}"; Description: "Launch UMDT GUI"; Flags: nowait postinstall skipifsilent
 
 [Registry]
 ; If the user selected the Add to PATH task, append the install dir to the user PATH (HKCU). Note: user will need to re-login to pick up new PATH.
