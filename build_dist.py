@@ -49,6 +49,16 @@ def build(cli_name: str = "umdt", gui_name: str = "umdt_gui"):
         sys.exit(2)
 
     common_args = [sys.executable, "-m", "PyInstaller", "--onefile", "--paths", UMDT_PKG_PATH]
+    # Ensure PyInstaller bundles dynamically imported serial/pymodbus modules
+    hidden_imports = [
+        "pymodbus.client.serial",
+        "pymodbus.client.sync",
+        "pymodbus.client",
+        "serial",
+        "serial.tools.list_ports",
+    ]
+    for hi in hidden_imports:
+        common_args += ["--hidden-import", hi]
 
     print("Building CLI executable (console)...")
     subprocess.check_call(common_args + ["--name", cli_name, cli_entry])
