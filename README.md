@@ -8,6 +8,9 @@ It has evolved into three distinct tools:
 2. **Mock Server**: A configurable simulation environment for creating virtual Modbus devices with fault injection.
 3. **Bridge**: A soft-gateway for routing Modbus traffic between TCP and Serial (RTU) networks.
 
+## Documentation
+For detailed user guides, installation instructions, and advanced topics, please refer to the [UMDT User Guide](https://github.com/kbralten/umdt/blob/main/user_docs/howto.md).
+
 ## 1. Interactive Tool (CLI & GUI)
 The interactive tool is designed for direct communication with Modbus devices.
 
