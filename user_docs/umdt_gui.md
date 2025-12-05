@@ -42,6 +42,11 @@ Use this tab to continuously poll a specific register or range of registers.
   - Changes are often highlighted.
   - Errors (timeouts, exceptions) are logged in the status area.
 
+Behavior notes:
+- When you start monitoring, the GUI will clear previously captured monitor samples if the monitored start address, the requested count, or the Long (32-bit) mode setting has changed. This prevents older samples from appearing under new column addresses and keeps captured data aligned with the configured view.
+- If you change monitoring parameters but leave the start address, count, and Long mode unchanged, existing captured samples are retained (the display will continue appending new samples). Toggle Long mode on/off will always clear samples because the column interpretation changes (single-register vs double-register columns).
+- As a convenience, clicking the Timestamp column or the first data column decodes the first register (or first double-register pair in Long mode). Clicking any other data cell decodes only the register or pair corresponding to that column.
+
 ### 3. Scan Tab
 Discover readable registers within a specific address range.
 

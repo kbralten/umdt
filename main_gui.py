@@ -101,15 +101,18 @@ class MonitorModel(QAbstractTableModel):
         self._decoding = "Signed"  # Hex, Unsigned, Signed, Float16
         self._long_mode = False
         self._endian = "big"
+        self._start_addr = 0
 
         self._data_type: DataType = DataType.HOLDING
 
-    def set_config(self, value_count: int, long_mode: bool, endian: str, data_type: DataType):
+    def set_config(self, value_count: int, long_mode: bool, endian: str, data_type: DataType, start_addr: int):
         """Configure column count and decoding parameters."""
+        # value_count represents displayed columns (single regs or double-reg pairs)
         self._value_count = value_count
         self._long_mode = long_mode
         self._endian = endian
         self._data_type = data_type
+        self._start_addr = max(0, int(start_addr))
         self.update_headers()
 
     def set_decoding(self, decoding: str):
@@ -131,7 +134,7 @@ class MonitorModel(QAbstractTableModel):
         return len(self._samples)
 
     def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:  # type: ignore[override]
-        # Timestamp + one column per register value
+        # Timestamp + one column per displayed value (register or double-register)
         return 1 + self._value_count
 
     def data(self, index: QModelIndex, role: int = Qt.DisplayRole):  # type: ignore[override]
@@ -155,26 +158,59 @@ class MonitorModel(QAbstractTableModel):
 
             # Columns 1+: register values with selected decoding
             reg_idx = col - 1
-            if reg_idx >= len(sample.raw_registers):
-                return ""
-
-            # Decode value based on datatype/decoding mode
             if is_bit_type(sample.data_type):
+                if reg_idx >= len(sample.raw_registers):
+                    return ""
                 bit_val = bool(sample.raw_registers[reg_idx])
                 return "ON" if bit_val else "OFF"
 
-            reg_val = int(sample.raw_registers[reg_idx])
+            # Non-bit types: interpret as 16-bit or 32-bit depending on long mode
+            if self._long_mode:
+                base = reg_idx * 2
+                if base + 1 >= len(sample.raw_registers):
+                    return ""
+                r1 = int(sample.raw_registers[base]) & 0xFFFF
+                r2 = int(sample.raw_registers[base + 1]) & 0xFFFF
+                b1 = r1.to_bytes(2, byteorder="big")
+                b2 = r2.to_bytes(2, byteorder="big")
+                bv = b1 + b2
+                if self._endian == "big":
+                    raw_be = bv
+                elif self._endian == "little":
+                    raw_be = bv[::-1]
+                elif self._endian == "mid-big":
+                    raw_be = bytes([bv[2], bv[3], bv[0], bv[1]])
+                else:
+                    raw_be = bytes([bv[1], bv[0], bv[3], bv[2]])
+                if self._decoding == "Hex":
+                    return "0x" + raw_be.hex().upper()
+                elif self._decoding == "Unsigned":
+                    return str(int.from_bytes(raw_be, byteorder="big", signed=False))
+                elif self._decoding == "Signed":
+                    return str(int.from_bytes(raw_be, byteorder="big", signed=True))
+                elif self._decoding == "Float16":
+                    # In long mode, treat as float32 for convenience
+                    import struct
+                    try:
+                        f32 = struct.unpack("!f", raw_be)[0]
+                        return f"{f32:.6g}"
+                    except Exception:
+                        return "—"
+                return str(int.from_bytes(raw_be, byteorder="big", signed=False))
+
+            # Short (16-bit) mode
+            if reg_idx >= len(sample.raw_registers):
+                return ""
+            reg_val = int(sample.raw_registers[reg_idx]) & 0xFFFF
 
             if self._decoding == "Hex":
                 return f"0x{reg_val:04X}"
             elif self._decoding == "Unsigned":
                 return str(reg_val)
             elif self._decoding == "Signed":
-                # Convert to signed int16
                 signed = reg_val if reg_val < 0x8000 else reg_val - 0x10000
                 return str(signed)
             elif self._decoding == "Float16":
-                # Decode as float16
                 try:
                     b = reg_val.to_bytes(2, byteorder="big", signed=False)
                     bb = b[::-1] if self._endian == "little" else b
@@ -196,8 +232,9 @@ class MonitorModel(QAbstractTableModel):
             if section == 0:
                 return "Timestamp"
             else:
-                reg_num = section - 1
-                return f"Reg{reg_num}"
+                col_idx = section - 1
+                addr = self._start_addr + (col_idx * 2 if self._long_mode else col_idx)
+                return str(addr)
         return super().headerData(section, orientation, role)
 
     def add_sample(self, sample: MonitorSample):
@@ -1202,9 +1239,9 @@ class MainWindow(QMainWindow):
             self.monitor_table.verticalHeader().setVisible(False)
         except Exception:
             pass
-        # Select whole rows for monitor and connect selection changed
+        # Select individual cells for monitor and connect selection changed
         try:
-            self.monitor_table.setSelectionBehavior(QTableView.SelectRows)
+            self.monitor_table.setSelectionBehavior(QTableView.SelectItems)
             self.monitor_table.setSelectionMode(QTableView.SingleSelection)
             self.monitor_table.selectionModel().selectionChanged.connect(self.on_monitor_selection_changed)
         except Exception:
@@ -2191,15 +2228,36 @@ class MainWindow(QMainWindow):
 
     def on_monitor_selection_changed(self, selected=None, deselected=None):
         try:
-            sel = self.monitor_table.selectionModel().selectedRows()
-            if not sel:
+            indexes = self.monitor_table.selectionModel().selectedIndexes()
+            if not indexes:
                 return
-            idx = sel[0].row()
-            sample = list(self.monitor_model._samples)[idx]
-            # format details table from raw registers across endianness
-            rows = self._compute_decoding_rows(sample.raw_registers)
+            idx = indexes[0]
+            row = idx.row()
+            col = idx.column()
+            sample = list(self.monitor_model._samples)[row]
+
+            # Choose which register(s) to decode based on selection
+            regs: List[int] = []
+            if is_bit_type(sample.data_type):
+                reg_idx = 0 if col == 0 else col - 1
+                if reg_idx >= len(sample.raw_registers):
+                    return
+                regs = [1 if sample.raw_registers[reg_idx] else 0]
+            elif self.monitor_model._long_mode:
+                pair_idx = 0 if col == 0 else col - 1
+                base = pair_idx * 2
+                if base + 1 >= len(sample.raw_registers):
+                    return
+                regs = [int(sample.raw_registers[base]) & 0xFFFF, int(sample.raw_registers[base + 1]) & 0xFFFF]
+            else:
+                reg_idx = 0 if col == 0 else col - 1
+                if reg_idx >= len(sample.raw_registers):
+                    return
+                regs = [int(sample.raw_registers[reg_idx]) & 0xFFFF]
+
+            rows = self._compute_decoding_rows(regs)
             table = self.monitor_details_table
-            is_32 = len(sample.raw_registers) >= 2
+            is_32 = len(regs) >= 2
             if is_32:
                 table.setColumnHidden(1, True)
                 table.setColumnHidden(2, True)
@@ -2267,11 +2325,23 @@ class MainWindow(QMainWindow):
         interval_sec = interval_ms / 1000.0
 
         unit = self._parse_int(self.unit_edit.text()) or 1
-        regs_to_read = count * 2 if long_mode else count
-
-        # Configure the model with register count for column headers
+        # Configure the model with displayed column count
         data_type = self._current_data_type()
-        self.monitor_model.set_config(regs_to_read, long_mode, e_norm, data_type)
+        # Determine whether the monitoring config changed (address/count/long_mode)
+        prev_start = getattr(self.monitor_model, '_start_addr', None)
+        prev_count = getattr(self.monitor_model, '_value_count', None)
+        prev_long = getattr(self.monitor_model, '_long_mode', None)
+        config_changed = (prev_start != addr) or (prev_count != count) or (prev_long != long_mode)
+
+        self.monitor_model.set_config(count, long_mode, e_norm, data_type, start_addr=addr)
+        # Clear old samples only when config changed (start addr, count or long toggle)
+        if config_changed:
+            self.monitor_model.clear_samples()
+            try:
+                self.monitor_details_table.clearContents()
+                self.monitor_details_table.setRowCount(0)
+            except Exception:
+                pass
 
         # Update UI state
         self.btn_monitor_start.setEnabled(False)
@@ -2280,7 +2350,7 @@ class MainWindow(QMainWindow):
 
         # Start the polling task
         self._monitor_task = asyncio.create_task(
-            self._monitor_polling_loop(addr, count, regs_to_read, long_mode, e_norm, unit, interval_sec, data_type)
+            self._monitor_polling_loop(addr, count, long_mode, e_norm, unit, interval_sec, data_type)
         )
 
     @qasync.asyncSlot()
@@ -2305,7 +2375,7 @@ class MainWindow(QMainWindow):
         self.monitor_model.clear_samples()
         self.monitor_status_label.setText("Cleared")
 
-    async def _monitor_polling_loop(self, addr: int, count: int, regs_to_read: int, long_mode: bool, endian: str, unit: int, interval_sec: float, data_type: DataType):
+    async def _monitor_polling_loop(self, addr: int, count: int, long_mode: bool, endian: str, unit: int, interval_sec: float, data_type: DataType):
         """Async polling loop that reads from the device at configured interval."""
         poll_count = 0
         while True:
